@@ -1,8 +1,17 @@
 #!/usr/bin/env python3
 """
-Bybit Futures Trading Bot
-Scans a watchlist every hour, calculates technical indicators, and places
-trades when confluence score >= 4/6 signals agree.
+APEX Bybit Futures Trading Bot — Upgraded
+Fixes applied:
+  1. Symbol-specific regime (XAUT uses gold proxy, not BTC)
+  2. TP snaps to nearest S/R pivot level
+  3. Long entries disabled until track record exists (LONG_ENABLED = False)
+  4. 15M Quick Exit requires 3-candle confirmation (45 min)
+  5. Weekly circuit breaker (-10% → pause 48h)
+  6. Correlation filter (max 2 BTC-correlated positions)
+  7. Dynamic position sizing by confluence score
+  8. Coin blacklist + spread check
+  9. Daily performance summary at 00:00 UTC
+ 10. 6-hour health-check ping to Discord
 """
 
 import os
@@ -26,27 +35,59 @@ import ta
 # Configuration
 # ---------------------------------------------------------------------------
 
-API_KEY = os.environ.get("BYBIT_API_KEY", "")
-API_SECRET = os.environ.get("BYBIT_API_SECRET", "")
+API_KEY            = os.environ.get("BYBIT_API_KEY", "")
+API_SECRET         = os.environ.get("BYBIT_API_SECRET", "")
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
 
 BASE_URL = "https://api.bybit.com"
 
-DYNAMIC_SCAN_TOP_N = 50          # Pull top N symbols by 24H volume
-DYNAMIC_VOLUME_MIN_USD = 50_000_000  # Minimum 24H volume in USD
-STABLECOIN_BASES = {"USDC", "BUSD", "TUSD", "USDP", "DAI", "FDUSD", "PYUSD"}
+DYNAMIC_SCAN_TOP_N       = 50
+DYNAMIC_VOLUME_MIN_USD   = 50_000_000
+STABLECOIN_BASES         = {"USDC", "BUSD", "TUSD", "USDP", "DAI", "FDUSD", "PYUSD"}
 
-RISK_PER_TRADE = 0.02       # 2% of account equity per trade
-MAX_LEVERAGE = 10
-MAX_OPEN_POSITIONS = 3      # Hard cap on concurrent open positions
-DAILY_LOSS_LIMIT = 0.05     # Stop trading if daily loss exceeds 5%
+# Risk & position limits
+RISK_PER_TRADE      = 0.02    # base 2% — scaled by score below
+MAX_LEVERAGE        = 10
+MAX_OPEN_POSITIONS  = 3
+DAILY_LOSS_LIMIT    = 0.05    # 5% daily  → pause until tomorrow
+WEEKLY_LOSS_LIMIT   = 0.10    # 10% weekly → pause 48 h
 SCAN_INTERVAL_SECONDS = 3600  # 1 hour
-CONFLUENCE_THRESHOLD = 4     # Minimum signals that must agree
+CONFLUENCE_THRESHOLD  = 4
+
+# ── NEW: Long guard ─────────────────────────────────────────────────────────
+# Set True only after Long logic has been validated with real trade data.
+LONG_ENABLED = False
+
+# ── NEW: Correlation filter ──────────────────────────────────────────────────
+# Coins that move closely with BTC — limit concurrent exposure
+MAX_CORRELATION_POSITIONS = 2
+BTC_CORRELATED = {
+    "ETHUSDT", "SOLUSDT", "BNBUSDT", "AVAXUSDT",
+    "LINKUSDT", "DOTUSDT", "MATICUSDT", "LTCUSDT",
+    "ADAUSDT", "ATOMUSDT", "NEARUSDT", "APTUSDT",
+}
+
+# ── NEW: Coin blacklist ──────────────────────────────────────────────────────
+COIN_BLACKLIST = {
+    "USDCUSDT", "TUSDUSDT", "BUSDUSDT", "USDTUSDT",
+    "FDUSDUSDT", "LDOUSDT", "STETHUSDT", "WBTCUSDT",
+    "SHIBUSDT", "PEPEUSDT", "FLOKIUSDT", "BTTUSDT",
+}
+MAX_SPREAD_PCT = 0.0015   # 0.15% max bid/ask spread
+
+# ── NEW: Dynamic position sizing by confluence score ─────────────────────────
+SCORE_SIZE_MAP = {4: 0.015, 5: 0.020, 6: 0.025}   # score → risk %
+
+# Exit parameters
+QUICK_PROFIT_R    = 0.8
+TIME_EXIT_HOURS   = 6
+TIME_EXIT_MIN_R   = 0.3
+FUNDING_SPIKE_PCT = 0.0005
+FUNDING_RATE_MAX  = 0.001
+FUNDING_RATE_MIN  = -0.001
 
 TRADE_JOURNAL_FILE = "trade_journal.json"
 
-# Populated at startup by load_instrument_cache()
-# symbol -> {"min_qty": float, "qty_step": float}
 _instrument_cache: dict = {}
 
 # ---------------------------------------------------------------------------
@@ -56,85 +97,13 @@ _instrument_cache: dict = {}
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler("bot.log"),
-    ],
+    handlers=[logging.StreamHandler(), logging.FileHandler("bot.log")],
 )
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Trade Journal
 # ---------------------------------------------------------------------------
-
-
-def get_dynamic_watchlist() -> list[str]:
-    """
-    Fetch top DYNAMIC_SCAN_TOP_N USDT perpetual futures from Bybit ranked by
-    24H turnover, then filter out stablecoins and low-volume symbols.
-    Falls back to an empty list on any error.
-    """
-    try:
-        resp = requests.get(
-            f"{BASE_URL}/v5/market/tickers",
-            params={"category": "linear"},
-            timeout=10,
-        )
-        data = resp.json()
-        if data.get("retCode") != 0:
-            log.warning("Dynamic watchlist fetch error: %s", data.get("retMsg"))
-            return []
-
-        tickers = data["result"]["list"]
-
-        # Keep only USDT-margined perps (symbol ends with USDT)
-        usdt_perps = [t for t in tickers if t["symbol"].endswith("USDT")]
-
-        # Sort by 24H turnover descending, take top N
-        def _turnover(t):
-            try:
-                return float(t.get("turnover24h", 0))
-            except (ValueError, TypeError):
-                return 0.0
-
-        top = sorted(usdt_perps, key=_turnover, reverse=True)[:DYNAMIC_SCAN_TOP_N]
-
-        qualified = []
-        for t in top:
-            symbol = t["symbol"]
-            # Strip the trailing USDT to get the base asset
-            base = symbol[:-4]
-            if base in STABLECOIN_BASES:
-                continue
-            vol_usd = _turnover(t)
-            if vol_usd < DYNAMIC_VOLUME_MIN_USD:
-                continue
-            qualified.append(symbol)
-
-        total = len(top)
-        passed = len(qualified)
-        log.info("Dynamic scan: %d/%d symbols qualified (volume ≥ $%.0fM)",
-                 passed, total, DYNAMIC_VOLUME_MIN_USD / 1_000_000)
-        return qualified
-
-    except Exception as e:
-        log.warning("get_dynamic_watchlist failed: %s", e)
-        return []
-
-
-def discord_notify(message: str) -> None:
-    """Send a message to the configured Discord webhook. Silent on failure."""
-    if not DISCORD_WEBHOOK_URL:
-        return
-    try:
-        requests.post(
-            DISCORD_WEBHOOK_URL,
-            json={"content": message},
-            timeout=10,
-        )
-    except Exception as e:
-        log.warning("Discord notify failed: %s", e)
-
 
 def load_journal() -> list:
     if os.path.exists(TRADE_JOURNAL_FILE):
@@ -156,270 +125,364 @@ def log_trade(entry: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Discord
+# ---------------------------------------------------------------------------
+
+def discord_notify(message: str) -> None:
+    if not DISCORD_WEBHOOK_URL:
+        return
+    try:
+        requests.post(DISCORD_WEBHOOK_URL, json={"content": message}, timeout=10)
+    except Exception as e:
+        log.warning("Discord notify failed: %s", e)
+
+
+# ---------------------------------------------------------------------------
+# Dynamic watchlist
+# ---------------------------------------------------------------------------
+
+def get_dynamic_watchlist() -> list[str]:
+    try:
+        resp = requests.get(
+            f"{BASE_URL}/v5/market/tickers",
+            params={"category": "linear"},
+            timeout=10,
+        )
+        data = resp.json()
+        if data.get("retCode") != 0:
+            log.warning("Dynamic watchlist fetch error: %s", data.get("retMsg"))
+            return []
+
+        tickers = data["result"]["list"]
+        usdt_perps = [t for t in tickers if t["symbol"].endswith("USDT")]
+
+        def _turnover(t):
+            try:
+                return float(t.get("turnover24h", 0))
+            except (ValueError, TypeError):
+                return 0.0
+
+        top = sorted(usdt_perps, key=_turnover, reverse=True)[:DYNAMIC_SCAN_TOP_N]
+
+        qualified = []
+        for t in top:
+            symbol = t["symbol"]
+            # ── Blacklist filter ──
+            if symbol in COIN_BLACKLIST:
+                log.info("%s SKIP — blacklisted", symbol)
+                continue
+            base = symbol[:-4]
+            if base in STABLECOIN_BASES:
+                continue
+            if _turnover(t) < DYNAMIC_VOLUME_MIN_USD:
+                continue
+            qualified.append(symbol)
+
+        log.info("Dynamic scan: %d/%d symbols qualified", len(qualified), len(top))
+        return qualified
+
+    except Exception as e:
+        log.warning("get_dynamic_watchlist failed: %s", e)
+        return []
+
+
+# ---------------------------------------------------------------------------
 # Bybit REST helpers
 # ---------------------------------------------------------------------------
 
-
 def _post_headers(body: str) -> dict:
-    """Build signed headers for a Bybit V5 POST request.
-    body must be the exact JSON string that will be sent as the request body.
-    """
-    timestamp = str(int(time.time() * 1000))
+    timestamp   = str(int(time.time() * 1000))
     recv_window = "5000"
-    param_str = timestamp + API_KEY + recv_window + body
-    signature = hmac.new(
-        API_SECRET.encode(), param_str.encode(), hashlib.sha256
-    ).hexdigest()
+    param_str   = timestamp + API_KEY + recv_window + body
+    signature   = hmac.new(API_SECRET.encode(), param_str.encode(), hashlib.sha256).hexdigest()
     return {
-        "X-BAPI-API-KEY": API_KEY,
-        "X-BAPI-TIMESTAMP": timestamp,
+        "X-BAPI-API-KEY":     API_KEY,
+        "X-BAPI-TIMESTAMP":   timestamp,
         "X-BAPI-RECV-WINDOW": recv_window,
-        "X-BAPI-SIGN": signature,
-        "Content-Type": "application/json",
+        "X-BAPI-SIGN":        signature,
+        "Content-Type":       "application/json",
     }
+
+
+def _signed_get(path: str, params: dict) -> Optional[dict]:
+    timestamp   = str(int(time.time() * 1000))
+    recv_window = "5000"
+    param_str   = timestamp + API_KEY + recv_window + "&".join(
+        f"{k}={v}" for k, v in sorted(params.items())
+    )
+    signature = hmac.new(API_SECRET.encode(), param_str.encode(), hashlib.sha256).hexdigest()
+    headers = {
+        "X-BAPI-API-KEY":     API_KEY,
+        "X-BAPI-TIMESTAMP":   timestamp,
+        "X-BAPI-RECV-WINDOW": recv_window,
+        "X-BAPI-SIGN":        signature,
+    }
+    try:
+        resp = requests.get(f"{BASE_URL}{path}", headers=headers, params=params, timeout=10)
+        return resp.json()
+    except Exception as e:
+        log.error("GET %s failed: %s", path, e)
+    return None
 
 
 def get_account_balance() -> Optional[float]:
-    """Return USDT wallet balance."""
-    url = f"{BASE_URL}/v5/account/wallet-balance"
-    params = {"accountType": "UNIFIED", "coin": "USDT"}
-    timestamp = str(int(time.time() * 1000))
-    recv_window = "5000"
-    param_str = timestamp + API_KEY + recv_window + "&".join(
-        f"{k}={v}" for k, v in sorted(params.items())
-    )
-    signature = hmac.new(
-        API_SECRET.encode(), param_str.encode(), hashlib.sha256
-    ).hexdigest()
-    headers = {
-        "X-BAPI-API-KEY": API_KEY,
-        "X-BAPI-TIMESTAMP": timestamp,
-        "X-BAPI-RECV-WINDOW": recv_window,
-        "X-BAPI-SIGN": signature,
-    }
-    try:
-        resp = requests.get(url, headers=headers, params=params, timeout=10)
-        data = resp.json()
-        if data.get("retCode") == 0:
-            for item in data["result"]["list"]:
-                for coin in item.get("coin", []):
-                    if coin["coin"] == "USDT":
-                        return float(coin["walletBalance"])
-    except Exception as e:
-        log.error("Failed to fetch balance: %s", e)
+    data = _signed_get("/v5/account/wallet-balance", {"accountType": "UNIFIED", "coin": "USDT"})
+    if data and data.get("retCode") == 0:
+        for item in data["result"]["list"]:
+            for coin in item.get("coin", []):
+                if coin["coin"] == "USDT":
+                    return float(coin["walletBalance"])
     return None
 
 
 def get_open_positions() -> dict:
-    """
-    Return a dict of currently open positions: {symbol: side}.
-    Only includes positions where the absolute size is non-zero.
-    """
-    url = f"{BASE_URL}/v5/position/list"
-    params = {"category": "linear", "settleCoin": "USDT"}
-    timestamp = str(int(time.time() * 1000))
-    recv_window = "5000"
-    param_str = timestamp + API_KEY + recv_window + "&".join(
-        f"{k}={v}" for k, v in sorted(params.items())
-    )
-    signature = hmac.new(
-        API_SECRET.encode(), param_str.encode(), hashlib.sha256
-    ).hexdigest()
-    headers = {
-        "X-BAPI-API-KEY": API_KEY,
-        "X-BAPI-TIMESTAMP": timestamp,
-        "X-BAPI-RECV-WINDOW": recv_window,
-        "X-BAPI-SIGN": signature,
-    }
-    try:
-        resp = requests.get(url, headers=headers, params=params, timeout=10)
-        data = resp.json()
-        if data.get("retCode") == 0:
-            positions = {}
-            for item in data["result"].get("list", []):
-                if float(item.get("size", 0)) != 0:
-                    positions[item["symbol"]] = item["side"]
-            return positions
-        log.warning("get_open_positions error: %s", data.get("retMsg"))
-    except Exception as e:
-        log.error("Failed to fetch open positions: %s", e)
+    data = _signed_get("/v5/position/list", {"category": "linear", "settleCoin": "USDT"})
+    if data and data.get("retCode") == 0:
+        return {
+            item["symbol"]: item["side"]
+            for item in data["result"].get("list", [])
+            if float(item.get("size", 0)) != 0
+        }
     return {}
 
 
 def get_position_details() -> list:
-    """
-    Return full details for all open positions.
-    Each dict includes: symbol, side, size, avgPrice, stopLoss, markPrice.
-    """
-    url = f"{BASE_URL}/v5/position/list"
-    params = {"category": "linear", "settleCoin": "USDT"}
-    timestamp = str(int(time.time() * 1000))
-    recv_window = "5000"
-    param_str = timestamp + API_KEY + recv_window + "&".join(
-        f"{k}={v}" for k, v in sorted(params.items())
-    )
-    signature = hmac.new(
-        API_SECRET.encode(), param_str.encode(), hashlib.sha256
-    ).hexdigest()
-    headers = {
-        "X-BAPI-API-KEY": API_KEY,
-        "X-BAPI-TIMESTAMP": timestamp,
-        "X-BAPI-RECV-WINDOW": recv_window,
-        "X-BAPI-SIGN": signature,
-    }
-    try:
-        resp = requests.get(url, headers=headers, params=params, timeout=10)
-        data = resp.json()
-        if data.get("retCode") == 0:
-            return [
-                item for item in data["result"].get("list", [])
-                if float(item.get("size", 0)) != 0
-            ]
-        log.warning("get_position_details error: %s", data.get("retMsg"))
-    except Exception as e:
-        log.error("Failed to fetch position details: %s", e)
+    data = _signed_get("/v5/position/list", {"category": "linear", "settleCoin": "USDT"})
+    if data and data.get("retCode") == 0:
+        return [
+            item for item in data["result"].get("list", [])
+            if float(item.get("size", 0)) != 0
+        ]
     return []
 
 
 def set_breakeven_sl(symbol: str, entry_price: float) -> bool:
-    """Move the stop loss on an open position to entry price (breakeven)."""
-    url = f"{BASE_URL}/v5/position/trading-stop"
     payload = {
-        "category": "linear",
-        "symbol": symbol,
-        "stopLoss": str(round(entry_price, 4)),
+        "category":    "linear",
+        "symbol":      symbol,
+        "stopLoss":    str(round(entry_price, 4)),
         "slTriggerBy": "LastPrice",
         "positionIdx": 0,
     }
+    body = json.dumps(payload)
     try:
-        body = json.dumps(payload)
-        resp = requests.post(url, headers=_post_headers(body), data=body, timeout=10)
+        resp = requests.post(
+            f"{BASE_URL}/v5/position/trading-stop",
+            headers=_post_headers(body), data=body, timeout=10,
+        )
         data = resp.json()
-        if data.get("retCode") == 0:
-            return True
-        log.error("set_breakeven_sl failed for %s: %s", symbol, data.get("retMsg"))
+        return data.get("retCode") == 0
     except Exception as e:
         log.error("set_breakeven_sl exception for %s: %s", symbol, e)
     return False
 
 
 def manage_breakeven(positions: list) -> None:
-    """
-    For each open position, check whether price has moved 1.5× the initial
-    risk distance into profit (TP1). If so, move SL to entry (breakeven).
-
-    Risk distance is inferred from the current SL: abs(entry - stopLoss).
-    Already-breakeven positions (SL within 0.1% of entry) are skipped.
-    """
     for pos in positions:
         symbol = pos.get("symbol", "")
-        side = pos.get("side", "")
+        side   = pos.get("side", "")
         try:
             entry = float(pos.get("avgPrice") or 0)
-            sl = float(pos.get("stopLoss") or 0)
-            mark = float(pos.get("markPrice") or 0)
+            sl    = float(pos.get("stopLoss") or 0)
+            mark  = float(pos.get("markPrice") or 0)
         except (ValueError, TypeError):
             continue
 
-        if entry == 0 or mark == 0:
+        if entry == 0 or mark == 0 or sl == 0:
             continue
-
-        # No SL set — nothing to manage
-        if sl == 0:
-            log.info("%s — no stop loss set, skipping breakeven check.", symbol)
-            continue
-
-        # Already at breakeven (SL within 0.1% of entry)
         if abs(sl - entry) / entry < 0.001:
             log.info("%s — SL already at breakeven (SL=%.4f entry=%.4f).", symbol, sl, entry)
             continue
 
         risk_dist = abs(entry - sl)
-        if side == "Buy":
-            tp1 = entry + 1.5 * risk_dist
-            tp1_reached = mark >= tp1
-        else:
-            tp1 = entry - 1.5 * risk_dist
-            tp1_reached = mark <= tp1
+        tp1 = (entry + 1.5 * risk_dist) if side == "Buy" else (entry - 1.5 * risk_dist)
+        tp1_reached = (mark >= tp1) if side == "Buy" else (mark <= tp1)
 
         if tp1_reached:
-            log.info(
-                "%s — TP1 reached (mark=%.4f ≥ tp1=%.4f), moving SL to breakeven at %.4f",
-                symbol, mark, tp1, entry,
-            )
             if set_breakeven_sl(symbol, entry):
-                log.info("%s — SL successfully moved to breakeven %.4f", symbol, entry)
+                log.info("%s — SL moved to breakeven %.4f", symbol, entry)
                 discord_notify(
-                    f"🔒 **Breakeven** {symbol} | TP1 reached at `{mark:.4f}` "
-                    f"| SL moved to entry `{entry:.4f}`"
+                    f"🔒 **Breakeven** {symbol} | TP1 `{mark:.4f}` | SL → entry `{entry:.4f}`"
                 )
-            else:
-                log.warning("%s — failed to move SL to breakeven", symbol)
-                discord_notify(f"⚠️ **{symbol}** — failed to move SL to breakeven")
         else:
-            pct_to_tp1 = abs(tp1 - mark) / mark * 100
-            log.info(
-                "%s — TP1 not yet reached (mark=%.4f tp1=%.4f, %.2f%% away)",
-                symbol, mark, tp1, pct_to_tp1,
-            )
-
-
-FUNDING_RATE_MAX = 0.001   # +0.1%
-FUNDING_RATE_MIN = -0.001  # -0.1%
+            pct = abs(tp1 - mark) / mark * 100
+            log.info("%s — TP1 not yet reached (mark=%.4f tp1=%.4f, %.2f%% away)",
+                     symbol, mark, tp1, pct)
 
 
 def get_funding_rate(symbol: str) -> Optional[float]:
-    """Return the current funding rate for a linear futures symbol."""
-    url = f"{BASE_URL}/v5/market/tickers"
-    params = {"category": "linear", "symbol": symbol}
     try:
-        resp = requests.get(url, params=params, timeout=10)
+        resp = requests.get(
+            f"{BASE_URL}/v5/market/tickers",
+            params={"category": "linear", "symbol": symbol},
+            timeout=10,
+        )
         data = resp.json()
         if data.get("retCode") == 0 and data["result"]["list"]:
             return float(data["result"]["list"][0]["fundingRate"])
-        log.warning("get_funding_rate error for %s: %s", symbol, data.get("retMsg"))
     except Exception as e:
-        log.error("Failed to fetch funding rate for %s: %s", symbol, e)
+        log.error("Funding rate error %s: %s", symbol, e)
+    return None
+
+
+def get_spread_pct(symbol: str) -> Optional[float]:
+    """Return bid/ask spread as a fraction. None on error."""
+    try:
+        resp = requests.get(
+            f"{BASE_URL}/v5/market/orderbook",
+            params={"category": "linear", "symbol": symbol, "limit": 1},
+            timeout=10,
+        )
+        data = resp.json()
+        if data.get("retCode") == 0:
+            bid = float(data["result"]["b"][0][0])
+            ask = float(data["result"]["a"][0][0])
+            mid = (bid + ask) / 2
+            return (ask - bid) / mid if mid > 0 else None
+    except Exception as e:
+        log.warning("Spread check error %s: %s", symbol, e)
     return None
 
 
 def get_klines(symbol: str, interval: str, limit: int = 300) -> Optional[pd.DataFrame]:
-    """
-    Fetch OHLCV klines from Bybit.
-    interval: '240' = 4H, '60' = 1H
-    """
-    url = f"{BASE_URL}/v5/market/kline"
-    params = {
-        "category": "linear",
-        "symbol": symbol,
-        "interval": interval,
-        "limit": limit,
-    }
     try:
-        resp = requests.get(url, params=params, timeout=10)
+        resp = requests.get(
+            f"{BASE_URL}/v5/market/kline",
+            params={"category": "linear", "symbol": symbol,
+                    "interval": interval, "limit": limit},
+            timeout=10,
+        )
         data = resp.json()
         if data.get("retCode") != 0:
             log.warning("Kline error for %s %s: %s", symbol, interval, data.get("retMsg"))
             return None
-        raw = data["result"]["list"]
         df = pd.DataFrame(
-            raw,
+            data["result"]["list"],
             columns=["timestamp", "open", "high", "low", "close", "volume", "turnover"],
         )
-        df = df.astype(
-            {"open": float, "high": float, "low": float, "close": float, "volume": float}
-        )
+        df = df.astype({"open": float, "high": float, "low": float,
+                        "close": float, "volume": float})
         df["timestamp"] = pd.to_datetime(df["timestamp"].astype(int), unit="ms")
         df.sort_values("timestamp", inplace=True)
         df.reset_index(drop=True, inplace=True)
         return df
     except Exception as e:
         log.error("Kline fetch failed for %s %s: %s", symbol, interval, e)
-        return None
+    return None
 
+
+def load_instrument_cache(symbols: list) -> None:
+    url = f"{BASE_URL}/v5/market/instruments-info"
+    for symbol in symbols:
+        try:
+            resp = requests.get(url, params={"category": "linear", "symbol": symbol}, timeout=10)
+            data = resp.json()
+            if data.get("retCode") == 0 and data["result"]["list"]:
+                lot = data["result"]["list"][0]["lotSizeFilter"]
+                _instrument_cache[symbol] = {
+                    "min_qty":  float(lot["minOrderQty"]),
+                    "qty_step": float(lot["qtyStep"]),
+                }
+        except Exception as e:
+            log.error("Instrument info error for %s: %s", symbol, e)
+
+
+def snap_qty(symbol: str, qty: float) -> float:
+    info = _instrument_cache.get(symbol)
+    if not info:
+        return round(qty, 3)
+    step    = info["qty_step"]
+    min_qty = info["min_qty"]
+    snapped = math.floor(qty / step) * step
+    decimals = len(str(step).rstrip("0").split(".")[-1]) if "." in str(step) else 0
+    snapped  = round(snapped, decimals)
+    return snapped if snapped >= min_qty else 0.0
+
+
+def set_leverage(symbol: str, leverage: int) -> bool:
+    payload = {
+        "category":    "linear",
+        "symbol":      symbol,
+        "buyLeverage": str(leverage),
+        "sellLeverage": str(leverage),
+    }
+    body = json.dumps(payload)
+    try:
+        resp = requests.post(
+            f"{BASE_URL}/v5/position/set-leverage",
+            headers=_post_headers(body), data=body, timeout=10,
+        )
+        data = resp.json()
+        return data.get("retCode") in (0, 110043)
+    except Exception as e:
+        log.error("Set leverage error: %s", e)
+    return False
+
+
+def place_order(symbol: str, side: str, qty: float,
+                sl_price: float, tp_price: float) -> Optional[dict]:
+    payload = {
+        "category":    "linear",
+        "symbol":      symbol,
+        "side":        side,
+        "orderType":   "Market",
+        "qty":         str(qty),
+        "stopLoss":    str(round(sl_price, 4)),
+        "takeProfit":  str(round(tp_price, 4)),
+        "timeInForce": "IOC",
+        "slTriggerBy": "LastPrice",
+        "tpTriggerBy": "LastPrice",
+        "positionIdx": 0,
+    }
+    body = json.dumps(payload)
+    try:
+        resp = requests.post(
+            f"{BASE_URL}/v5/order/create",
+            headers=_post_headers(body), data=body, timeout=10,
+        )
+        data = resp.json()
+        if data.get("retCode") == 0:
+            log.info("Order placed: %s %s qty=%s", side, symbol, qty)
+            return data["result"]
+        log.error("Order failed for %s: %s", symbol, data.get("retMsg"))
+    except Exception as e:
+        log.error("Place order exception: %s", e)
+    return None
+
+
+def close_position(symbol: str, side: str, qty: float) -> Optional[dict]:
+    close_side = "Sell" if side == "Buy" else "Buy"
+    payload = {
+        "category":    "linear",
+        "symbol":      symbol,
+        "side":        close_side,
+        "orderType":   "Market",
+        "qty":         str(qty),
+        "timeInForce": "IOC",
+        "reduceOnly":  True,
+        "positionIdx": 0,
+    }
+    body = json.dumps(payload)
+    try:
+        resp = requests.post(
+            f"{BASE_URL}/v5/order/create",
+            headers=_post_headers(body), data=body, timeout=10,
+        )
+        data = resp.json()
+        if data.get("retCode") == 0:
+            log.info("Position closed: %s %s qty=%s", symbol, close_side, qty)
+            return data["result"]
+        log.error("close_position failed for %s: %s", symbol, data.get("retMsg"))
+    except Exception as e:
+        log.error("close_position exception for %s: %s", symbol, e)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Regime detection — symbol-specific
+# ---------------------------------------------------------------------------
 
 def _classify_ema(close: "pd.Series") -> str:
-    """Return BULL / BEAR / RANGE based on EMA 9/50/200 alignment."""
     ema9   = ta.trend.EMAIndicator(close, window=9).ema_indicator().iloc[-1]
     ema50  = ta.trend.EMAIndicator(close, window=50).ema_indicator().iloc[-1]
     ema200 = ta.trend.EMAIndicator(close, window=200).ema_indicator().iloc[-1]
@@ -430,347 +493,155 @@ def _classify_ema(close: "pd.Series") -> str:
     return "RANGE"
 
 
-def get_market_regime() -> dict:
-    """
-    Multi-timeframe regime using BTC 4H + 1H EMA 9/50/200.
-
-    Returns a dict:
-        regime_4h   : BULL | BEAR | RANGE
-        regime_1h   : BULL | BEAR | RANGE
-        allowed     : Buy | Sell | SKIP
-        threshold   : minimum confluence score required (4 or 5)
-
-    Alignment rules (no counter-trend trading):
-        4H BULL + 1H BULL  → Buy,  threshold 4
-        4H BULL + 1H RANGE → Buy,  threshold 5
-        4H BEAR + 1H BEAR  → Sell, threshold 4
-        4H BEAR + 1H RANGE → Sell, threshold 5
-        anything else      → SKIP
-    """
-    df4h = get_klines("BTCUSDT", "240", limit=250)
-    df1h = get_klines("BTCUSDT", "60",  limit=250)
+def _compute_regime(proxy_symbol: str) -> dict:
+    """Compute multi-TF regime for a given proxy symbol."""
+    df4h = get_klines(proxy_symbol, "240", limit=250)
+    df1h = get_klines(proxy_symbol, "60",  limit=250)
 
     fallback = {"regime_4h": "RANGE", "regime_1h": "RANGE",
-                "allowed": "SKIP", "threshold": 5}
+                "allowed": "SKIP", "threshold": 5, "proxy": proxy_symbol}
 
     if df4h is None or len(df4h) < 200:
-        log.warning("Regime check: insufficient 4H data — defaulting to SKIP")
+        log.warning("Regime: insufficient 4H data for %s — defaulting SKIP", proxy_symbol)
         return fallback
 
     r4h = _classify_ema(df4h["close"])
-
     r1h = "RANGE"
     if df1h is not None and len(df1h) >= 50:
         r1h = _classify_ema(df1h["close"])
 
-    # Determine allowed direction and score threshold
     if r4h == "BULL":
-        if r1h == "BULL":
-            allowed, threshold = "Buy", 4
-        elif r1h == "RANGE":
-            allowed, threshold = "Buy", 5
-        else:                          # 1H BEAR conflicts with 4H BULL
-            allowed, threshold = "SKIP", 5
+        if r1h == "BULL":    allowed, threshold = "Buy",  4
+        elif r1h == "RANGE": allowed, threshold = "Buy",  5
+        else:                allowed, threshold = "SKIP", 5
     elif r4h == "BEAR":
-        if r1h == "BEAR":
-            allowed, threshold = "Sell", 4
-        elif r1h == "RANGE":
-            allowed, threshold = "Sell", 5
-        else:                          # 1H BULL conflicts with 4H BEAR
-            allowed, threshold = "SKIP", 5
-    else:                              # 4H RANGE → no new entries
+        if r1h == "BEAR":    allowed, threshold = "Sell", 4
+        elif r1h == "RANGE": allowed, threshold = "Sell", 5
+        else:                allowed, threshold = "SKIP", 5
+    else:
         allowed, threshold = "SKIP", 5
 
-    log.info(
-        "REGIME: 4H=%s 1H=%s → allowed=%s threshold=%d",
-        r4h, r1h, allowed, threshold,
-    )
+    log.info("REGIME [%s]: 4H=%s 1H=%s → allowed=%s threshold=%d",
+             proxy_symbol, r4h, r1h, allowed, threshold)
     return {"regime_4h": r4h, "regime_1h": r1h,
-            "allowed": allowed, "threshold": threshold}
+            "allowed": allowed, "threshold": threshold, "proxy": proxy_symbol}
 
 
-def load_instrument_cache(symbols: list) -> None:
-    """Fetch lot size constraints for each symbol and store in _instrument_cache."""
-    url = f"{BASE_URL}/v5/market/instruments-info"
-    for symbol in symbols:
-        try:
-            resp = requests.get(
-                url,
-                params={"category": "linear", "symbol": symbol},
-                timeout=10,
-            )
-            data = resp.json()
-            if data.get("retCode") == 0 and data["result"]["list"]:
-                lot = data["result"]["list"][0]["lotSizeFilter"]
-                _instrument_cache[symbol] = {
-                    "min_qty": float(lot["minOrderQty"]),
-                    "qty_step": float(lot["qtyStep"]),
-                }
-                log.info(
-                    "Instrument %s — min_qty=%s  qty_step=%s",
-                    symbol, lot["minOrderQty"], lot["qtyStep"],
-                )
-            else:
-                log.warning(
-                    "Could not fetch instrument info for %s: %s",
-                    symbol, data.get("retMsg"),
-                )
-        except Exception as e:
-            log.error("Instrument info error for %s: %s", symbol, e)
+def get_market_regime() -> dict:
+    """General market regime using BTC as proxy."""
+    return _compute_regime("BTCUSDT")
 
 
-def snap_qty(symbol: str, qty: float) -> float:
+def get_symbol_regime(symbol: str) -> dict:
     """
-    Round qty DOWN to the symbol's qty_step and enforce min_qty.
-    Returns 0.0 if the snapped qty falls below min_qty.
+    Symbol-specific regime.
+    Gold (XAUTUSDT) uses its own price action; all others use BTC.
     """
-    info = _instrument_cache.get(symbol)
-    if not info:
-        return round(qty, 3)  # no cache entry — use safe fallback
-
-    step = info["qty_step"]
-    min_qty = info["min_qty"]
-
-    # Floor to nearest step to avoid 'qty too precise' rejections
-    snapped = math.floor(qty / step) * step
-
-    # Match decimal precision of the step value
-    decimals = (
-        len(str(step).rstrip("0").split(".")[-1]) if "." in str(step) else 0
-    )
-    snapped = round(snapped, decimals)
-
-    if snapped < min_qty:
-        return 0.0
-    return snapped
-
-
-def set_leverage(symbol: str, leverage: int) -> bool:
-    url = f"{BASE_URL}/v5/position/set-leverage"
-    payload = {
-        "category": "linear",
-        "symbol": symbol,
-        "buyLeverage": str(leverage),
-        "sellLeverage": str(leverage),
-    }
-    try:
-        body = json.dumps(payload)
-        resp = requests.post(url, headers=_post_headers(body), data=body, timeout=10)
-        data = resp.json()
-        if data.get("retCode") in (0, 110043):  # 110043 = leverage not modified
-            return True
-        log.warning("Set leverage failed for %s: %s", symbol, data.get("retMsg"))
-    except Exception as e:
-        log.error("Set leverage error: %s", e)
-    return False
-
-
-def place_order(
-    symbol: str,
-    side: str,
-    qty: float,
-    sl_price: float,
-    tp_price: float,
-) -> Optional[dict]:
-    """Place a market order with SL and TP on Bybit linear futures."""
-    url = f"{BASE_URL}/v5/order/create"
-    payload = {
-        "category": "linear",
-        "symbol": symbol,
-        "side": side,
-        "orderType": "Market",
-        "qty": str(qty),
-        "stopLoss": str(round(sl_price, 4)),
-        "takeProfit": str(round(tp_price, 4)),
-        "timeInForce": "IOC",
-        "slTriggerBy": "LastPrice",
-        "tpTriggerBy": "LastPrice",
-        "positionIdx": 0,
-    }
-    try:
-        body = json.dumps(payload)
-        resp = requests.post(url, headers=_post_headers(body), data=body, timeout=10)
-        data = resp.json()
-        if data.get("retCode") == 0:
-            log.info("Order placed: %s %s %s qty=%s", side, symbol, data["result"]["orderId"], qty)
-            return data["result"]
-        log.error("Order failed for %s: %s", symbol, data.get("retMsg"))
-    except Exception as e:
-        log.error("Place order exception: %s", e)
-    return None
-
-
-def close_position(symbol: str, side: str, qty: float) -> Optional[dict]:
-    """
-    Close an open position with a reduce-only market order.
-    `side` is the *position* side ("Buy" for long, "Sell" for short).
-    The closing order uses the opposite side.
-    """
-    close_side = "Sell" if side == "Buy" else "Buy"
-    url = f"{BASE_URL}/v5/order/create"
-    payload = {
-        "category": "linear",
-        "symbol": symbol,
-        "side": close_side,
-        "orderType": "Market",
-        "qty": str(qty),
-        "timeInForce": "IOC",
-        "reduceOnly": True,
-        "positionIdx": 0,
-    }
-    try:
-        body = json.dumps(payload)
-        resp = requests.post(url, headers=_post_headers(body), data=body, timeout=10)
-        data = resp.json()
-        if data.get("retCode") == 0:
-            log.info("Position closed: %s %s qty=%s orderId=%s",
-                     symbol, close_side, qty, data["result"]["orderId"])
-            return data["result"]
-        log.error("close_position failed for %s: %s", symbol, data.get("retMsg"))
-    except Exception as e:
-        log.error("close_position exception for %s: %s", symbol, e)
-    return None
+    proxy = "XAUTUSDT" if "XAU" in symbol else "BTCUSDT"
+    return _compute_regime(proxy)
 
 
 # ---------------------------------------------------------------------------
 # Indicators
 # ---------------------------------------------------------------------------
 
-
 def compute_indicators(df: pd.DataFrame) -> dict:
-    """
-    Compute EMA 9/50/200, VWAP, RSI, Stochastic RSI, and MACD.
-    Returns a dict with the latest values.
-    """
-    close = df["close"]
-    high = df["high"]
-    low = df["low"]
+    close  = df["close"]
+    high   = df["high"]
+    low    = df["low"]
     volume = df["volume"]
 
-    ema9 = ta.trend.EMAIndicator(close, window=9).ema_indicator()
-    ema50 = ta.trend.EMAIndicator(close, window=50).ema_indicator()
+    ema9   = ta.trend.EMAIndicator(close, window=9).ema_indicator()
+    ema50  = ta.trend.EMAIndicator(close, window=50).ema_indicator()
     ema200 = ta.trend.EMAIndicator(close, window=200).ema_indicator()
 
-    # VWAP (cumulative approximation over available data)
     typical_price = (high + low + close) / 3
     vwap = (typical_price * volume).cumsum() / volume.cumsum()
 
     rsi = ta.momentum.RSIIndicator(close, window=14).rsi()
 
-    stoch_rsi = ta.momentum.StochRSIIndicator(close, window=14, smooth1=3, smooth2=3)
-    stoch_k = stoch_rsi.stochrsi_k()
-    stoch_d = stoch_rsi.stochrsi_d()
+    stoch   = ta.momentum.StochRSIIndicator(close, window=14, smooth1=3, smooth2=3)
+    stoch_k = stoch.stochrsi_k()
+    stoch_d = stoch.stochrsi_d()
 
-    macd_ind = ta.trend.MACD(close, window_slow=26, window_fast=12, window_sign=9)
-    macd_line = macd_ind.macd()
+    macd_ind    = ta.trend.MACD(close, window_slow=26, window_fast=12, window_sign=9)
+    macd_line   = macd_ind.macd()
     macd_signal = macd_ind.macd_signal()
 
     return {
         "close": close.iloc[-1],
-        "ema9": ema9.iloc[-1],
-        "ema50": ema50.iloc[-1],
-        "ema200": ema200.iloc[-1],
-        "vwap": vwap.iloc[-1],
-        "rsi": rsi.iloc[-1],
-        "stoch_k": stoch_k.iloc[-1],
-        "stoch_d": stoch_d.iloc[-1],
-        "macd": macd_line.iloc[-1],
-        "macd_signal": macd_signal.iloc[-1],
+        "ema9":  ema9.iloc[-1],  "ema50":  ema50.iloc[-1],  "ema200": ema200.iloc[-1],
+        "vwap":  vwap.iloc[-1],
+        "rsi":   rsi.iloc[-1],
+        "stoch_k": stoch_k.iloc[-1],  "stoch_d": stoch_d.iloc[-1],
+        "macd":  macd_line.iloc[-1],  "macd_signal": macd_signal.iloc[-1],
     }
 
 
-def check_reversal_signals(symbol: str, position_side: str, df: pd.DataFrame) -> tuple[int, list[str]]:
-    """
-    Check 5 reversal signals on the 1H dataframe against an open position.
+# ---------------------------------------------------------------------------
+# Reversal signal checker
+# ---------------------------------------------------------------------------
 
-    position_side = "Buy"  → long position → look for bearish reversal
-    position_side = "Sell" → short position → look for bullish reversal
-
-    Returns (signal_count, signal_names).
-    """
+def check_reversal_signals(symbol: str, position_side: str,
+                           df: pd.DataFrame) -> tuple[int, list[str]]:
     if len(df) < 3:
         return 0, []
 
-    close = df["close"]
-    high  = df["high"]
-    low   = df["low"]
-    open_ = df["open"]
+    close  = df["close"]
+    high   = df["high"]
+    low    = df["low"]
+    open_  = df["open"]
 
-    # Indicator series
     ema9     = ta.trend.EMAIndicator(close, window=9).ema_indicator()
     rsi_ser  = ta.momentum.RSIIndicator(close, window=14).rsi()
     stoch    = ta.momentum.StochRSIIndicator(close, window=14, smooth1=3, smooth2=3)
     stoch_k  = stoch.stochrsi_k()
     stoch_d  = stoch.stochrsi_d()
     macd_ind = ta.trend.MACD(close, window_slow=26, window_fast=12, window_sign=9)
-    hist_ser = macd_ind.macd_diff()  # histogram = macd - signal
+    hist_ser = macd_ind.macd_diff()
 
-    # Current and previous bar values
-    c_close = close.iloc[-1];    p_close = close.iloc[-2]
-    c_open  = open_.iloc[-1];    p_open  = open_.iloc[-2]
-    c_high  = high.iloc[-1];     p_high  = high.iloc[-2]   # noqa: F841
-    c_low   = low.iloc[-1];      p_low   = low.iloc[-2]    # noqa: F841
-    c_ema9  = ema9.iloc[-1];     p_ema9  = ema9.iloc[-2]
-    c_rsi   = rsi_ser.iloc[-1];  p_rsi   = rsi_ser.iloc[-2]
-    c_k     = stoch_k.iloc[-1];  p_k     = stoch_k.iloc[-2]
-    c_d     = stoch_d.iloc[-1];  p_d     = stoch_d.iloc[-2]
-    c_hist  = hist_ser.iloc[-1]; p_hist  = hist_ser.iloc[-2]
+    c_close = close.iloc[-1];  p_close = close.iloc[-2]
+    c_open  = open_.iloc[-1];  p_open  = open_.iloc[-2]
+    c_high  = high.iloc[-1];   p_high  = high.iloc[-2]   # noqa
+    c_low   = low.iloc[-1];    p_low   = low.iloc[-2]    # noqa
+    c_ema9  = ema9.iloc[-1];   p_ema9  = ema9.iloc[-2]
+    c_rsi   = rsi_ser.iloc[-1]; p_rsi  = rsi_ser.iloc[-2]
+    c_k     = stoch_k.iloc[-1]; p_k    = stoch_k.iloc[-2]
+    c_d     = stoch_d.iloc[-1]; p_d    = stoch_d.iloc[-2]
+    c_hist  = hist_ser.iloc[-1]; p_hist = hist_ser.iloc[-2]
 
     signals: list[str] = []
 
     if position_side == "Sell":
-        # --- Bullish reversal signals (exit short) ---
-
-        # 1. RSI crosses above 50
         if p_rsi < 50 and c_rsi >= 50:
             signals.append("RSI>50")
-
-        # 2. StochRSI K crosses above D from below 20
         if p_k < 20 and p_k <= p_d and c_k > c_d:
             signals.append("StochRSI_cross_up")
-
-        # 3. MACD histogram flips negative → positive
         if p_hist < 0 and c_hist >= 0:
             signals.append("MACD_hist_flip_up")
-
-        # 4. Price crosses back above EMA9
         if p_close < p_ema9 and c_close >= c_ema9:
             signals.append("price>EMA9")
-
-        # 5. Bullish Engulfing or Hammer
         body    = abs(c_close - c_open)
         lo_wick = min(c_close, c_open) - c_low
         hi_wick = c_high - max(c_close, c_open)
-        hammer = (body > 0 and lo_wick >= 2 * body and hi_wick <= body)
+        hammer  = body > 0 and lo_wick >= 2 * body and hi_wick <= body
         bull_eng = (p_close < p_open and c_close > c_open
                     and c_open <= p_close and c_close >= p_open)
         if hammer or bull_eng:
             signals.append("BullishPattern")
-
-    else:  # position_side == "Buy"
-        # --- Bearish reversal signals (exit long) ---
-
-        # 1. RSI drops below 50
+    else:
         if p_rsi > 50 and c_rsi <= 50:
             signals.append("RSI<50")
-
-        # 2. StochRSI K crosses below D from above 80
         if p_k > 80 and p_k >= p_d and c_k < c_d:
             signals.append("StochRSI_cross_down")
-
-        # 3. MACD histogram flips positive → negative
         if p_hist > 0 and c_hist <= 0:
             signals.append("MACD_hist_flip_down")
-
-        # 4. Price crosses below EMA9
         if p_close > p_ema9 and c_close <= c_ema9:
             signals.append("price<EMA9")
-
-        # 5. Bearish Engulfing or Shooting Star
         body    = abs(c_close - c_open)
         lo_wick = min(c_close, c_open) - c_low
         hi_wick = c_high - max(c_close, c_open)
-        shooting_star = (body > 0 and hi_wick >= 2 * body and lo_wick <= body)
+        shooting_star = body > 0 and hi_wick >= 2 * body and lo_wick <= body
         bear_eng = (p_close > p_open and c_close < c_open
                     and c_open >= p_close and c_close <= p_open)
         if shooting_star or bear_eng:
@@ -782,25 +653,10 @@ def check_reversal_signals(symbol: str, position_side: str, df: pd.DataFrame) ->
 
 
 # ---------------------------------------------------------------------------
-# Unified exit manager (replaces manage_reversals + manage_quick_exits)
+# 15M momentum — 3-candle confirmation (45 min)
 # ---------------------------------------------------------------------------
 
-QUICK_PROFIT_R       = 0.8    # Close if uPnL ≥ 0.8R within any cycle
-TIME_EXIT_HOURS      = 6      # Close if held longer than this …
-TIME_EXIT_MIN_R      = 0.3    # … and profit is below this R multiple
-FUNDING_SPIKE_PCT    = 0.0005 # ±0.05% funding rate triggers exit while in profit
-
-
 def check_15m_momentum(symbol: str, position_side: str) -> bool:
-    """
-    Return True if 15M momentum reversal is CONFIRMED across 2 consecutive candles.
-
-    Requires both the current AND the previous 15M candle to show:
-      Long position → price < EMA9  AND  RSI < 50  (bearish)
-      Short position → price > EMA9  AND  RSI > 50  (bullish)
-
-    2-candle requirement eliminates single-candle false spikes.
-    """
     df = get_klines(symbol, "15", limit=60)
     if df is None or len(df) < 20:
         return False
@@ -810,36 +666,27 @@ def check_15m_momentum(symbol: str, position_side: str) -> bool:
     rsi   = ta.momentum.RSIIndicator(close, window=14).rsi()
 
     if position_side == "Buy":
-        # Bearish momentum must hold on both last 2 candles
-        candle_curr = close.iloc[-1] < ema9.iloc[-1] and rsi.iloc[-1] < 50
-        candle_prev = close.iloc[-2] < ema9.iloc[-2] and rsi.iloc[-2] < 50
+        c1 = close.iloc[-1] < ema9.iloc[-1] and rsi.iloc[-1] < 50
+        c2 = close.iloc[-2] < ema9.iloc[-2] and rsi.iloc[-2] < 50
+        c3 = close.iloc[-3] < ema9.iloc[-3] and rsi.iloc[-3] < 50
     else:
-        # Bullish momentum must hold on both last 2 candles
-        candle_curr = close.iloc[-1] > ema9.iloc[-1] and rsi.iloc[-1] > 50
-        candle_prev = close.iloc[-2] > ema9.iloc[-2] and rsi.iloc[-2] > 50
+        c1 = close.iloc[-1] > ema9.iloc[-1] and rsi.iloc[-1] > 50
+        c2 = close.iloc[-2] > ema9.iloc[-2] and rsi.iloc[-2] > 50
+        c3 = close.iloc[-3] > ema9.iloc[-3] and rsi.iloc[-3] > 50
 
-    confirmed = candle_curr and candle_prev
+    confirmed = c1 and c2 and c3  # 3 consecutive candles = 45 min
     if confirmed:
-        log.info("%s — 15M momentum confirmed (2/2 candles) for %s position", symbol, position_side)
+        log.info("%s — 15M momentum confirmed (3/3 candles) for %s position",
+                 symbol, position_side)
     return confirmed
 
 
-def manage_exits(position_details: list, regime: Optional[dict] = None) -> dict[str, bool]:
-    """
-    Unified exit manager. Checks every open position in strict priority order
-    (SL is always first but handled by the exchange automatically):
+# ---------------------------------------------------------------------------
+# Unified exit manager
+# ---------------------------------------------------------------------------
 
-      Priority 1 — 0.8R quick profit
-      Priority 2 — Dynamic reversal 3/5 signals (+ optional regime-conflict bonus)
-      Priority 3 — 15M momentum (2-candle confirmed)
-      Priority 4 — Funding rate spike while in profit
-      Priority 5 — Time exit (>6 h with <0.3R profit)
-
-    Regime-conflict rule: if the current regime conflicts with a position's
-    direction, +1 is added to its reversal score (but does NOT force close alone).
-
-    Returns {symbol: True} for every position that was closed.
-    """
+def manage_exits(position_details: list,
+                 regime: Optional[dict] = None) -> dict[str, bool]:
     EXIT_THRESHOLD = 3
     closed: dict[str, bool] = {}
     now_ms = int(time.time() * 1000)
@@ -866,65 +713,53 @@ def manage_exits(position_details: list, regime: Optional[dict] = None) -> dict[
         icon  = "⚡"
         label = "QUICK EXIT"
 
-        # ── Priority 1: 0.8R quick profit ──────────────────────────────────
+        # ── Priority 1: 0.8R quick profit ──
         if r_usdt > 0 and upnl >= QUICK_PROFIT_R * r_usdt:
             exit_reason = f"0.8R profit (`{upnl:.2f}` ≥ `{QUICK_PROFIT_R * r_usdt:.2f}` USDT)"
 
-        # ── Priority 2: Dynamic reversal 3/5 (+ regime-conflict bonus) ─────
+        # ── Priority 2: reversal 3/5 + regime-conflict bonus ──
         if exit_reason is None:
             df1h = get_klines(symbol, "60", limit=100)
             if df1h is not None and len(df1h) >= 3:
                 rev_count, rev_fired = check_reversal_signals(symbol, side, df1h)
-
-                # Regime-conflict bonus: +1 if regime opposes position direction
                 regime_bonus = 0
                 if regime:
                     allowed = regime.get("allowed", "SKIP")
-                    position_dir = "Buy" if side == "Buy" else "Sell"
-                    if allowed == "SKIP" or allowed != position_dir:
+                    pos_dir = "Buy" if side == "Buy" else "Sell"
+                    if allowed == "SKIP" or allowed != pos_dir:
                         regime_bonus = 1
-                        log.info(
-                            "%s — regime conflict bonus +1 (allowed=%s, pos=%s). "
-                            "Reversal: %d→%d/5 signals %s",
-                            symbol, allowed, position_dir,
-                            rev_count, rev_count + regime_bonus, rev_fired,
-                        )
-
+                        log.info("%s — regime conflict bonus +1 (allowed=%s, pos=%s). "
+                                 "Reversal: %d→%d/5 %s",
+                                 symbol, allowed, pos_dir,
+                                 rev_count, rev_count + regime_bonus, rev_fired)
                 if rev_count + regime_bonus >= EXIT_THRESHOLD:
                     sig_list = rev_fired + (["RegimeConflict"] if regime_bonus else [])
-                    exit_reason = (
-                        f"reversal `{rev_count + regime_bonus}/5` "
-                        f"[{', '.join(sig_list)}]"
-                    )
+                    exit_reason = (f"reversal `{rev_count + regime_bonus}/5` "
+                                   f"[{', '.join(sig_list)}]")
 
-        # ── Priority 3: 15M momentum (2-candle confirmed) ──────────────────
-        if exit_reason is None:
-            if check_15m_momentum(symbol, side):
-                exit_reason = "15M momentum (2-candle confirmed)"
+        # ── Priority 3: 15M momentum (3-candle) ──
+        if exit_reason is None and check_15m_momentum(symbol, side):
+            exit_reason = "15M momentum (3-candle confirmed)"
 
-        # ── Priority 4: Funding rate spike while in profit ──────────────────
+        # ── Priority 4: funding spike while in profit ──
         if exit_reason is None and upnl > 0:
             funding = get_funding_rate(symbol)
             if funding is not None and abs(funding) >= FUNDING_SPIKE_PCT:
                 exit_reason = f"funding spike `{funding * 100:.4f}%` while in profit"
 
-        # ── Priority 5: Time exit ───────────────────────────────────────────
+        # ── Priority 5: time exit ──
         if exit_reason is None:
             if hours_held > TIME_EXIT_HOURS and r_usdt > 0 and upnl < TIME_EXIT_MIN_R * r_usdt:
                 icon  = "⏰"
                 label = "TIME EXIT"
-                exit_reason = (
-                    f"held `{hours_held:.1f}h`, profit `{upnl:.2f}` "
-                    f"< `{TIME_EXIT_MIN_R * r_usdt:.2f}` USDT (0.3R)"
-                )
+                exit_reason = (f"held `{hours_held:.1f}h`, profit `{upnl:.2f}` "
+                               f"< `{TIME_EXIT_MIN_R * r_usdt:.2f}` USDT (0.3R)")
 
         if exit_reason is None:
             continue
 
-        log.warning(
-            "%s — %s [%s] | %s | uPnL=%s | held=%.1fh",
-            symbol, label, dlabel, exit_reason, pnl_str, hours_held,
-        )
+        log.warning("%s — %s [%s] | %s | uPnL=%s | held=%.1fh",
+                    symbol, label, dlabel, exit_reason, pnl_str, hours_held)
 
         result = close_position(symbol, side, qty)
         if result:
@@ -934,9 +769,7 @@ def manage_exits(position_details: list, regime: Optional[dict] = None) -> dict[
             )
             closed[symbol] = True
         else:
-            discord_notify(
-                f"⚠️ **{symbol}** — exit order FAILED | {exit_reason}"
-            )
+            discord_notify(f"⚠️ **{symbol}** — exit order FAILED | {exit_reason}")
 
     return closed
 
@@ -945,111 +778,115 @@ def manage_exits(position_details: list, regime: Optional[dict] = None) -> dict[
 # Signal scoring
 # ---------------------------------------------------------------------------
 
-
-def score_signals(ind4h: dict, ind1h: dict) -> tuple[int, str]:
-    """
-    Score 6 confluence signals. Returns (score, direction).
-    direction is 'Buy' or 'Sell' based on the dominant side.
-    """
-    buy_signals = 0
+def score_signals(ind4h: dict, ind1h: dict) -> tuple[int, str, list]:
+    buy_signals  = 0
     sell_signals = 0
-    details = []
+    details: list[str] = []
 
-    # 1. EMA trend alignment (4H): price > EMA9 > EMA50 > EMA200 → bullish
     if ind4h["close"] > ind4h["ema9"] > ind4h["ema50"] > ind4h["ema200"]:
-        buy_signals += 1
-        details.append("EMA_bull")
+        buy_signals  += 1; details.append("EMA_bull")
     elif ind4h["close"] < ind4h["ema9"] < ind4h["ema50"] < ind4h["ema200"]:
-        sell_signals += 1
-        details.append("EMA_bear")
+        sell_signals += 1; details.append("EMA_bear")
 
-    # 2. VWAP (1H): price above VWAP → bullish
     if ind1h["close"] > ind1h["vwap"]:
-        buy_signals += 1
-        details.append("VWAP_bull")
+        buy_signals  += 1; details.append("VWAP_bull")
     elif ind1h["close"] < ind1h["vwap"]:
-        sell_signals += 1
-        details.append("VWAP_bear")
+        sell_signals += 1; details.append("VWAP_bear")
 
-    # 3. RSI (1H): oversold < 40 → bullish setup, overbought > 60 → bearish setup
     if ind1h["rsi"] < 40:
-        buy_signals += 1
-        details.append("RSI_bull")
+        buy_signals  += 1; details.append("RSI_bull")
     elif ind1h["rsi"] > 60:
-        sell_signals += 1
-        details.append("RSI_bear")
+        sell_signals += 1; details.append("RSI_bear")
 
-    # 4. Stochastic RSI (1H): K crosses above D and K < 80 → bullish
     if ind1h["stoch_k"] > ind1h["stoch_d"] and ind1h["stoch_k"] < 80:
-        buy_signals += 1
-        details.append("StochRSI_bull")
+        buy_signals  += 1; details.append("StochRSI_bull")
     elif ind1h["stoch_k"] < ind1h["stoch_d"] and ind1h["stoch_k"] > 20:
-        sell_signals += 1
-        details.append("StochRSI_bear")
+        sell_signals += 1; details.append("StochRSI_bear")
 
-    # 5. MACD (4H): MACD line above signal line → bullish
     if ind4h["macd"] > ind4h["macd_signal"]:
-        buy_signals += 1
-        details.append("MACD_bull")
+        buy_signals  += 1; details.append("MACD_bull")
     elif ind4h["macd"] < ind4h["macd_signal"]:
-        sell_signals += 1
-        details.append("MACD_bear")
+        sell_signals += 1; details.append("MACD_bear")
 
-    # 6. EMA crossover confirmation (1H): EMA9 > EMA50 → bullish momentum
     if ind1h["ema9"] > ind1h["ema50"]:
-        buy_signals += 1
-        details.append("EMA1H_bull")
+        buy_signals  += 1; details.append("EMA1H_bull")
     elif ind1h["ema9"] < ind1h["ema50"]:
-        sell_signals += 1
-        details.append("EMA1H_bear")
+        sell_signals += 1; details.append("EMA1H_bear")
 
     if buy_signals >= sell_signals:
         return buy_signals, "Buy", details
-    else:
-        return sell_signals, "Sell", details
+    return sell_signals, "Sell", details
 
 
-def calculate_position(
-    balance: float,
-    entry_price: float,
-    sl_price: float,
-    leverage: int,
-) -> float:
-    """
-    Calculate position size based on 2% risk and max leverage.
-    Returns quantity in base asset units.
-    """
-    risk_amount = balance * RISK_PER_TRADE
+def calculate_position(balance: float, entry_price: float,
+                       sl_price: float, leverage: int,
+                       score: int = 4) -> float:
+    """Position size scaled by confluence score."""
+    risk_pct    = SCORE_SIZE_MAP.get(score, RISK_PER_TRADE)
+    risk_amount = balance * risk_pct
     sl_distance = abs(entry_price - sl_price)
     if sl_distance == 0:
         return 0.0
     qty_usdt = (risk_amount / sl_distance) * entry_price
     max_qty_usdt = balance * leverage
     qty_usdt = min(qty_usdt, max_qty_usdt)
-    qty = qty_usdt / entry_price
-    return round(qty, 3)
+    return round(qty_usdt / entry_price, 3)
 
 
 # ---------------------------------------------------------------------------
-# Daily loss guard
+# Loss guards
 # ---------------------------------------------------------------------------
 
-
-def daily_loss_exceeded(starting_balance: float, current_balance: float) -> bool:
-    if starting_balance <= 0:
+def daily_loss_exceeded(starting: float, current: float) -> bool:
+    if starting <= 0:
         return False
-    loss_pct = (starting_balance - current_balance) / starting_balance
-    return loss_pct >= DAILY_LOSS_LIMIT
+    return (starting - current) / starting >= DAILY_LOSS_LIMIT
+
+
+def weekly_loss_exceeded(starting: float, current: float) -> bool:
+    if starting <= 0:
+        return False
+    return (starting - current) / starting >= WEEKLY_LOSS_LIMIT
+
+
+# ---------------------------------------------------------------------------
+# Daily performance summary
+# ---------------------------------------------------------------------------
+
+def send_daily_summary(balance: float) -> None:
+    journal = load_journal()
+    today   = datetime.date.today().isoformat()
+    today_trades = [t for t in journal if str(t.get("timestamp", "")).startswith(today)]
+
+    wins   = sum(1 for t in today_trades if t.get("order_result"))
+    total  = len(today_trades)
+    wr_pct = (wins / total * 100) if total > 0 else 0
+
+    open_pos = get_open_positions()
+    open_str = ", ".join(f"`{s}`" for s in open_pos) if open_pos else "None"
+
+    discord_notify(
+        f"📈 **DAILY SUMMARY** | {today}\n"
+        f"• Trades taken: `{total}`\n"
+        f"• Win rate: `{wr_pct:.0f}%` ({wins}/{total})\n"
+        f"• Open positions: {open_str}\n"
+        f"• Balance: `{balance:.2f}` USDT"
+    )
 
 
 # ---------------------------------------------------------------------------
 # Main scan loop
 # ---------------------------------------------------------------------------
 
-
-def scan_symbol(symbol: str, balance: float, regime: Optional[dict] = None) -> Optional[dict]:
-    """Analyse one symbol and return a trade dict if a signal fires, else None."""
+def scan_symbol(symbol: str, balance: float,
+                regime: Optional[dict] = None) -> Optional[dict]:
     log.info("Scanning %s …", symbol)
+
+    # ── Spread check ──────────────────────────────────────────────────────
+    spread = get_spread_pct(symbol)
+    if spread is not None and spread > MAX_SPREAD_PCT:
+        log.info("%s SKIP — spread too wide (%.4f%%)", symbol, spread * 100)
+        return None
 
     df4h = get_klines(symbol, "240")
     df1h = get_klines(symbol, "60")
@@ -1058,71 +895,73 @@ def scan_symbol(symbol: str, balance: float, regime: Optional[dict] = None) -> O
         log.warning("Insufficient data for %s", symbol)
         return None
 
-    # --- Volume confirmation filter (4H) ---
-    avg_vol_20 = df4h["volume"].iloc[-21:-1].mean()   # last 20 closed candles
+    # ── Volume confirmation ────────────────────────────────────────────────
+    avg_vol_20  = df4h["volume"].iloc[-21:-1].mean()
     current_vol = df4h["volume"].iloc[-1]
-    vol_ratio = current_vol / avg_vol_20 if avg_vol_20 > 0 else 0.0
-
+    vol_ratio   = current_vol / avg_vol_20 if avg_vol_20 > 0 else 0.0
     if vol_ratio < 1.2:
-        log.info("%s — Volume: %.2fx avg — SKIP low volume confirmation", symbol, vol_ratio)
+        log.info("%s — Volume %.2fx avg — SKIP", symbol, vol_ratio)
         return None
-    log.info("%s — Volume: %.2fx avg — OK", symbol, vol_ratio)
 
     ind4h = compute_indicators(df4h)
     ind1h = compute_indicators(df1h)
-
     score, direction, details = score_signals(ind4h, ind1h)
 
-    log.info(
-        "%s | score=%d/6 dir=%s signals=%s",
-        symbol, score, direction, details,
-    )
+    log.info("%s | score=%d/6 dir=%s signals=%s", symbol, score, direction, details)
 
-    # --- Multi-timeframe regime filter ---
-    if regime is None:
-        regime = {"allowed": "SKIP", "threshold": 5, "regime_4h": "?", "regime_1h": "?"}
+    # ── Long guard ────────────────────────────────────────────────────────
+    if direction == "Buy" and not LONG_ENABLED:
+        log.info("%s SKIP — Long entries disabled (LONG_ENABLED=False)", symbol)
+        return None
 
-    allowed   = regime.get("allowed", "SKIP")
-    threshold = regime.get("threshold", CONFLUENCE_THRESHOLD)
+    # ── Symbol-specific regime ────────────────────────────────────────────
+    sym_regime = get_symbol_regime(symbol)
+    allowed    = sym_regime.get("allowed", "SKIP")
+    threshold  = sym_regime.get("threshold", CONFLUENCE_THRESHOLD)
 
     if allowed == "SKIP":
-        log.info(
-            "%s SKIP — regime conflict/range (4H=%s 1H=%s), no new entries.",
-            symbol, regime.get("regime_4h"), regime.get("regime_1h"),
-        )
+        log.info("%s SKIP — symbol regime conflict/range (proxy=%s)",
+                 symbol, sym_regime.get("proxy"))
         return None
     if allowed != direction:
-        log.info(
-            "%s SKIP — regime allows %s only, signal direction is %s.",
-            symbol, allowed, direction,
-        )
+        log.info("%s SKIP — symbol regime allows %s only, signal=%s", symbol, allowed, direction)
         return None
     if score < threshold:
-        log.info(
-            "%s SKIP — score %d < required %d (4H=%s 1H=%s).",
-            symbol, score, threshold, regime.get("regime_4h"), regime.get("regime_1h"),
-        )
+        log.info("%s SKIP — score %d < required %d", symbol, score, threshold)
         return None
 
-    entry = ind1h["close"]
+    # ── Correlation filter ────────────────────────────────────────────────
+    if symbol in BTC_CORRELATED:
+        open_pos = get_open_positions()
+        btc_corr_count = sum(1 for s in open_pos if s in BTC_CORRELATED)
+        if btc_corr_count >= MAX_CORRELATION_POSITIONS:
+            log.info("%s SKIP — BTC-correlated cap reached (%d/%d)",
+                     symbol, btc_corr_count, MAX_CORRELATION_POSITIONS)
+            return None
+
+    entry      = ind1h["close"]
     atr_approx = (df1h["high"].iloc[-14:] - df1h["low"].iloc[-14:]).mean()
 
+    # ── TP snapped to nearest S/R pivot ───────────────────────────────────
+    recent_4h  = df4h.iloc[-20:]
+    pivot_high = recent_4h["high"].max()
+    pivot_low  = recent_4h["low"].min()
+    pivot_mid  = (pivot_high + pivot_low) / 2
+
     if direction == "Buy":
-        sl = entry - 2 * atr_approx
-        tp = entry + 4 * atr_approx
+        sl     = entry - 2 * atr_approx
+        raw_tp = entry + 4 * atr_approx
+        candidates = [p for p in [pivot_mid, pivot_high] if entry < p <= raw_tp * 1.02]
+        tp = min(candidates) if candidates else raw_tp
     else:
-        sl = entry + 2 * atr_approx
-        tp = entry - 4 * atr_approx
+        sl     = entry + 2 * atr_approx
+        raw_tp = entry - 4 * atr_approx
+        candidates = [p for p in [pivot_mid, pivot_low] if entry > p >= raw_tp * 0.98]
+        tp = max(candidates) if candidates else raw_tp
 
     leverage = min(MAX_LEVERAGE, 10)
-    qty = calculate_position(balance, entry, sl, leverage)
-
-    # RANGE regime: reduce position size by 50%
-    if regime == "RANGE":
-        qty *= 0.5
-        log.info("%s RANGE regime — position size halved.", symbol)
-
-    qty = snap_qty(symbol, qty)
+    qty      = calculate_position(balance, entry, sl, leverage, score)
+    qty      = snap_qty(symbol, qty)
 
     if qty <= 0:
         log.warning("Calculated qty is 0 for %s, skipping", symbol)
@@ -1133,27 +972,23 @@ def scan_symbol(symbol: str, balance: float, regime: Optional[dict] = None) -> O
 
     trade = {
         "timestamp": datetime.datetime.utcnow().isoformat(),
-        "symbol": symbol,
+        "symbol":    symbol,
         "direction": direction,
-        "score": score,
-        "signals": details,
-        "entry": entry,
-        "sl": round(sl, 4),
-        "tp": round(tp, 4),
-        "qty": qty,
-        "leverage": leverage,
+        "score":     score,
+        "signals":   details,
+        "entry":     entry,
+        "sl":        round(sl, 4),
+        "tp":        round(tp, 4),
+        "qty":       qty,
+        "leverage":  leverage,
         "order_result": result,
-        "ind_4h": {k: round(v, 6) if isinstance(v, float) else v for k, v in ind4h.items()},
-        "ind_1h": {k: round(v, 6) if isinstance(v, float) else v for k, v in ind1h.items()},
     }
-
     log_trade(trade)
 
-    # Discord alert on successful order
     if result:
         emoji = "🟢" if direction == "Buy" else "🔴"
         discord_notify(
-            f"{emoji} **{direction} {symbol}** | Score {score}/6 | "
+            f"{emoji} **{direction} {symbol}** | Score `{score}/6` | "
             f"Entry `{entry:.4f}` | SL `{round(sl, 4)}` | TP `{round(tp, 4)}` | "
             f"Qty `{qty}` × {leverage}x"
         )
@@ -1162,7 +997,7 @@ def scan_symbol(symbol: str, balance: float, regime: Optional[dict] = None) -> O
 
 
 # ---------------------------------------------------------------------------
-# UptimeRobot keep-alive HTTP server
+# Keep-alive HTTP server
 # ---------------------------------------------------------------------------
 
 HTTP_PORT = int(os.environ.get("PORT", 5000))
@@ -1178,7 +1013,7 @@ class _PingHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def log_message(self, format, *args):
-        pass  # silence default request logging
+        pass
 
 
 def _start_http_server():
@@ -1188,54 +1023,96 @@ def _start_http_server():
         try:
             server = HTTPServer(("0.0.0.0", port), _PingHandler)
             server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            log.info("Keep-alive HTTP server listening on port %d", port)
+            log.info("Keep-alive HTTP server on port %d", port)
             server.serve_forever()
             return
         except OSError as e:
             log.warning("Port %d in use (%s), trying %d …", port, e.strerror, port + 1)
-            continue
-    log.error("Could not bind HTTP server on ports %d–%d — keep-alive disabled",
-              HTTP_PORT, HTTP_PORT + 4)
+    log.error("Could not bind HTTP server — keep-alive disabled")
 
+
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
 
 def main():
     log.info("=" * 60)
-    log.info("Bybit Futures Trading Bot starting")
+    log.info("APEX Bybit Futures Trading Bot starting")
     log.info("Dynamic scan: top %d USDT perps, vol ≥ $%.0fM",
              DYNAMIC_SCAN_TOP_N, DYNAMIC_VOLUME_MIN_USD / 1_000_000)
+    log.info("Long enabled: %s", LONG_ENABLED)
     log.info("=" * 60)
+
     discord_notify(
         f"🚀 **APEX Bot started** | Dynamic scan: top {DYNAMIC_SCAN_TOP_N} USDT perps "
-        f"with vol ≥ ${DYNAMIC_VOLUME_MIN_USD/1_000_000:.0f}M"
+        f"with vol ≥ ${DYNAMIC_VOLUME_MIN_USD/1_000_000:.0f}M | "
+        f"Long: {'✅' if LONG_ENABLED else '❌ disabled'}"
     )
 
-    # Start keep-alive server in background thread for UptimeRobot
-    t = threading.Thread(target=_start_http_server, daemon=True)
-    t.start()
+    threading.Thread(target=_start_http_server, daemon=True).start()
 
     if not API_KEY or not API_SECRET:
-        log.error(
-            "BYBIT_API_KEY and BYBIT_API_SECRET environment variables are not set. "
-            "Please set them before running the bot."
-        )
+        log.error("API keys not set — exiting.")
         return
 
-    # Record the starting balance for the daily loss guard
-    day_start = datetime.date.today()
     starting_balance = get_account_balance()
     if starting_balance is None:
-        log.error("Could not fetch account balance. Check API credentials.")
+        log.error("Could not fetch balance. Check API credentials.")
         return
 
     log.info("Starting balance: %.2f USDT", starting_balance)
 
+    day_start              = datetime.date.today()
+    week_start             = day_start - datetime.timedelta(days=day_start.weekday())
+    week_starting_balance  = starting_balance
+    weekly_pause_until     = None
+    last_health_check      = datetime.datetime.utcnow()
+    daily_summary_sent     = False
+
     while True:
-        # Reset daily baseline at midnight
-        today = datetime.date.today()
+        now_utc = datetime.datetime.utcnow()
+        today   = datetime.date.today()
+
+        # ── Weekly pause check ──
+        if weekly_pause_until and now_utc < weekly_pause_until:
+            remaining = (weekly_pause_until - now_utc).total_seconds() / 3600
+            log.warning("Weekly loss limit active — paused %.1fh remaining.", remaining)
+            time.sleep(SCAN_INTERVAL_SECONDS)
+            continue
+
+        # ── Daily reset ──
         if today != day_start:
-            day_start = today
-            starting_balance = get_account_balance() or starting_balance
+            day_start         = today
+            starting_balance  = get_account_balance() or starting_balance
+            daily_summary_sent = False
             log.info("New day — reset daily baseline to %.2f USDT", starting_balance)
+
+        # ── Weekly reset ──
+        current_week = today - datetime.timedelta(days=today.weekday())
+        if current_week != week_start:
+            week_start            = current_week
+            week_starting_balance = get_account_balance() or starting_balance
+            log.info("New week — reset weekly baseline to %.2f USDT", week_starting_balance)
+
+        # ── Daily summary at 00:00 UTC ──
+        if now_utc.hour == 0 and now_utc.minute < 10 and not daily_summary_sent:
+            current_bal = get_account_balance()
+            if current_bal:
+                send_daily_summary(current_bal)
+            daily_summary_sent = True
+
+        # ── 6-hour health check ──
+        if (now_utc - last_health_check).total_seconds() >= 21_600:
+            current_bal = get_account_balance() or 0
+            open_pos    = get_open_positions()
+            next_scan   = now_utc + datetime.timedelta(seconds=SCAN_INTERVAL_SECONDS)
+            discord_notify(
+                f"💚 **APEX Bot alive** | "
+                f"Positions: `{len(open_pos)}/{MAX_OPEN_POSITIONS}` | "
+                f"Balance: `{current_bal:.2f}` USDT | "
+                f"Next scan: `{next_scan.strftime('%H:%M')} UTC`"
+            )
+            last_health_check = now_utc
 
         current_balance = get_account_balance()
         if current_balance is None:
@@ -1243,107 +1120,94 @@ def main():
             time.sleep(SCAN_INTERVAL_SECONDS)
             continue
 
+        # ── Daily loss guard ──
         if daily_loss_exceeded(starting_balance, current_balance):
             loss_pct = (starting_balance - current_balance) / starting_balance * 100
-            log.warning(
-                "Daily loss limit reached (%.2f → %.2f USDT). "
-                "Pausing until tomorrow.",
-                starting_balance, current_balance,
-            )
+            log.warning("Daily loss limit — pausing until tomorrow.")
             discord_notify(
-                f"🛑 **Daily loss limit hit** | Start `{starting_balance:.2f}` → "
-                f"Now `{current_balance:.2f}` USDT (`-{loss_pct:.1f}%`) | Pausing until tomorrow"
+                f"🛑 **Daily loss limit hit** | "
+                f"`{starting_balance:.2f}` → `{current_balance:.2f}` USDT "
+                f"(`-{loss_pct:.1f}%`) | Pausing until tomorrow"
             )
             time.sleep(SCAN_INTERVAL_SECONDS)
             continue
 
-        # --- Regime fetched first so exit manager can use it ---
-        # (also used in scan loop below; fetched here so position exits see the
-        #  current regime even when max-positions early-exit skips the scan)
+        # ── Weekly loss guard ──
+        if weekly_loss_exceeded(week_starting_balance, current_balance):
+            weekly_pause_until = now_utc + datetime.timedelta(hours=48)
+            loss_pct = (week_starting_balance - current_balance) / week_starting_balance * 100
+            log.warning("Weekly loss limit hit — pausing 48 h.")
+            discord_notify(
+                f"🛑 **WEEKLY LOSS LIMIT HIT** | "
+                f"`{week_starting_balance:.2f}` → `{current_balance:.2f}` USDT "
+                f"(`-{loss_pct:.1f}%`) | Pausing **48 hours**"
+            )
+            time.sleep(SCAN_INTERVAL_SECONDS)
+            continue
+
+        # ── Regime (BTC proxy for general market) ──
         regime = get_market_regime()
 
-        # --- Position check + breakeven management at start of every cycle ---
+        # ── Position management ──
         open_positions = get_open_positions()
-        pos_count = len(open_positions)
-        log.info(
-            "Open positions: %d/%d %s | Balance: %.2f USDT",
-            pos_count, MAX_OPEN_POSITIONS, list(open_positions.keys()), current_balance,
-        )
+        pos_count      = len(open_positions)
+        log.info("Open positions: %d/%d %s | Balance: %.2f USDT",
+                 pos_count, MAX_OPEN_POSITIONS,
+                 list(open_positions.keys()), current_balance)
 
-        # Run breakeven manager + unified exit checks (priority ordered)
         if pos_count > 0:
             position_details = get_position_details()
             if position_details:
                 manage_breakeven(position_details)
                 closed = manage_exits(position_details, regime)
                 if closed:
-                    # Refresh position count after any forced exits
                     open_positions = get_open_positions()
-                    pos_count = len(open_positions)
+                    pos_count      = len(open_positions)
 
         if pos_count >= MAX_OPEN_POSITIONS:
-            next_scan = datetime.datetime.utcnow() + datetime.timedelta(seconds=SCAN_INTERVAL_SECONDS)
-            log.info(
-                "Max positions reached (%d/%d). Skipping scan. Next at %s UTC",
-                pos_count, MAX_OPEN_POSITIONS, next_scan.strftime("%H:%M:%S"),
-            )
+            next_scan = now_utc + datetime.timedelta(seconds=SCAN_INTERVAL_SECONDS)
+            log.info("Max positions (%d/%d). Skipping scan. Next at %s UTC",
+                     pos_count, MAX_OPEN_POSITIONS, next_scan.strftime("%H:%M:%S"))
             time.sleep(SCAN_INTERVAL_SECONDS)
             continue
 
-        # --- Build dynamic watchlist for this cycle ---
+        # ── Dynamic watchlist ──
         watchlist = get_dynamic_watchlist()
         if not watchlist:
-            log.warning("Dynamic watchlist returned 0 symbols — skipping scan cycle")
+            log.warning("Empty watchlist — skipping cycle")
             time.sleep(SCAN_INTERVAL_SECONDS)
             continue
 
-        # Refresh instrument lot-size cache for any new symbols
         load_instrument_cache(watchlist)
 
         for symbol in watchlist:
-            # Hard cap check before each symbol
             if len(open_positions) >= MAX_OPEN_POSITIONS:
-                log.info(
-                    "Max positions reached (%d/%d). Stopping scan early.",
-                    len(open_positions), MAX_OPEN_POSITIONS,
-                )
+                log.info("Max positions reached — stopping scan early.")
                 break
-
-            # Skip symbols already in an open position
             if symbol in open_positions:
-                log.info("%s already has an open %s position — skipping.", symbol, open_positions[symbol])
+                log.info("%s already open — skipping.", symbol)
                 continue
 
-            # Funding rate filter
             funding = get_funding_rate(symbol)
             if funding is None:
-                log.warning("%s — could not fetch funding rate, skipping.", symbol)
                 continue
-            if funding > FUNDING_RATE_MAX:
-                log.info("%s SKIP — funding rate too high (%.4f%%)", symbol, funding * 100)
+            if not (FUNDING_RATE_MIN <= funding <= FUNDING_RATE_MAX):
+                log.info("%s SKIP — funding out of range (%.4f%%)", symbol, funding * 100)
                 continue
-            if funding < FUNDING_RATE_MIN:
-                log.info("%s SKIP — funding rate too negative (%.4f%%)", symbol, funding * 100)
-                continue
-            log.info("%s funding rate OK: %.4f%%", symbol, funding * 100)
 
             try:
                 trade = scan_symbol(symbol, current_balance, regime)
-                # If an order was actually placed, refresh positions immediately
                 if trade and trade.get("order_result"):
                     open_positions = get_open_positions()
-                    log.info(
-                        "Post-order positions: %d/%d %s",
-                        len(open_positions), MAX_OPEN_POSITIONS, list(open_positions.keys()),
-                    )
             except Exception as e:
                 log.error("Unexpected error scanning %s: %s", symbol, e)
 
-            time.sleep(2)  # brief pause between symbols to avoid rate limits
+            time.sleep(2)
 
-        next_scan = datetime.datetime.utcnow() + datetime.timedelta(seconds=SCAN_INTERVAL_SECONDS)
+        next_scan    = now_utc + datetime.timedelta(seconds=SCAN_INTERVAL_SECONDS)
+        regime_label = (f"{regime.get('regime_4h','?')}/{regime.get('regime_1h','?')}"
+                        f" → {regime.get('allowed','?')}")
         log.info("Scan complete. Next scan at %s UTC", next_scan.strftime("%H:%M:%S"))
-        regime_label = f"{regime.get('regime_4h','?')}/{regime.get('regime_1h','?')} → {regime.get('allowed','?')}"
         discord_notify(
             f"📊 **Scan complete** | Regime: `{regime_label}` | "
             f"Positions: `{len(open_positions)}/{MAX_OPEN_POSITIONS}` | "
