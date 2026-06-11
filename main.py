@@ -418,52 +418,75 @@ def get_klines(symbol: str, interval: str, limit: int = 300) -> Optional[pd.Data
         return None
 
 
-def get_market_regime() -> str:
-    """
-    Determine the current market regime using BTC 4H and 1D EMA alignment.
+def _classify_ema(close: "pd.Series") -> str:
+    """Return BULL / BEAR / RANGE based on EMA 9/50/200 alignment."""
+    ema9   = ta.trend.EMAIndicator(close, window=9).ema_indicator().iloc[-1]
+    ema50  = ta.trend.EMAIndicator(close, window=50).ema_indicator().iloc[-1]
+    ema200 = ta.trend.EMAIndicator(close, window=200).ema_indicator().iloc[-1]
+    if ema9 > ema50 > ema200:
+        return "BULL"
+    if ema9 < ema50 < ema200:
+        return "BEAR"
+    return "RANGE"
 
-    BULL  — EMA9 > EMA50 > EMA200 on 4H  → long signals only
-    BEAR  — EMA9 < EMA50 < EMA200 on 4H  → short signals only
-    RANGE — EMAs mixed on 4H              → reduced size, score >= 5 required
+
+def get_market_regime() -> dict:
+    """
+    Multi-timeframe regime using BTC 4H + 1H EMA 9/50/200.
+
+    Returns a dict:
+        regime_4h   : BULL | BEAR | RANGE
+        regime_1h   : BULL | BEAR | RANGE
+        allowed     : Buy | Sell | SKIP
+        threshold   : minimum confluence score required (4 or 5)
+
+    Alignment rules (no counter-trend trading):
+        4H BULL + 1H BULL  → Buy,  threshold 4
+        4H BULL + 1H RANGE → Buy,  threshold 5
+        4H BEAR + 1H BEAR  → Sell, threshold 4
+        4H BEAR + 1H RANGE → Sell, threshold 5
+        anything else      → SKIP
     """
     df4h = get_klines("BTCUSDT", "240", limit=250)
-    df1d = get_klines("BTCUSDT", "D", limit=250)
+    df1h = get_klines("BTCUSDT", "60",  limit=250)
+
+    fallback = {"regime_4h": "RANGE", "regime_1h": "RANGE",
+                "allowed": "SKIP", "threshold": 5}
 
     if df4h is None or len(df4h) < 200:
-        log.warning("Regime check: insufficient 4H data, defaulting to RANGE")
-        return "RANGE"
+        log.warning("Regime check: insufficient 4H data — defaulting to SKIP")
+        return fallback
 
-    close4h = df4h["close"]
-    ema9_4h = ta.trend.EMAIndicator(close4h, window=9).ema_indicator().iloc[-1]
-    ema50_4h = ta.trend.EMAIndicator(close4h, window=50).ema_indicator().iloc[-1]
-    ema200_4h = ta.trend.EMAIndicator(close4h, window=200).ema_indicator().iloc[-1]
+    r4h = _classify_ema(df4h["close"])
 
-    # Optional 1D confirmation (used for logging; 4H is the primary signal)
-    d1_trend = "N/A"
-    if df1d is not None and len(df1d) >= 200:
-        close1d = df1d["close"]
-        ema9_1d = ta.trend.EMAIndicator(close1d, window=9).ema_indicator().iloc[-1]
-        ema50_1d = ta.trend.EMAIndicator(close1d, window=50).ema_indicator().iloc[-1]
-        ema200_1d = ta.trend.EMAIndicator(close1d, window=200).ema_indicator().iloc[-1]
-        if ema9_1d > ema50_1d > ema200_1d:
-            d1_trend = "BULL"
-        elif ema9_1d < ema50_1d < ema200_1d:
-            d1_trend = "BEAR"
-        else:
-            d1_trend = "RANGE"
+    r1h = "RANGE"
+    if df1h is not None and len(df1h) >= 50:
+        r1h = _classify_ema(df1h["close"])
 
-    if ema9_4h > ema50_4h > ema200_4h:
-        regime = "BULL"
-    elif ema9_4h < ema50_4h < ema200_4h:
-        regime = "BEAR"
-    else:
-        regime = "RANGE"
+    # Determine allowed direction and score threshold
+    if r4h == "BULL":
+        if r1h == "BULL":
+            allowed, threshold = "Buy", 4
+        elif r1h == "RANGE":
+            allowed, threshold = "Buy", 5
+        else:                          # 1H BEAR conflicts with 4H BULL
+            allowed, threshold = "SKIP", 5
+    elif r4h == "BEAR":
+        if r1h == "BEAR":
+            allowed, threshold = "Sell", 4
+        elif r1h == "RANGE":
+            allowed, threshold = "Sell", 5
+        else:                          # 1H BULL conflicts with 4H BEAR
+            allowed, threshold = "SKIP", 5
+    else:                              # 4H RANGE → no new entries
+        allowed, threshold = "SKIP", 5
 
     log.info(
-        "REGIME: %s  (4H EMA9=%.2f EMA50=%.2f EMA200=%.2f | 1D trend=%s)",
-        regime, ema9_4h, ema50_4h, ema200_4h, d1_trend,
+        "REGIME: 4H=%s 1H=%s → allowed=%s threshold=%d",
+        r4h, r1h, allowed, threshold,
     )
-    return regime
+    return {"regime_4h": r4h, "regime_1h": r1h,
+            "allowed": allowed, "threshold": threshold}
 
 
 def load_instrument_cache(symbols: list) -> None:
@@ -804,6 +827,137 @@ def manage_reversals(position_details: list) -> dict[str, bool]:
 
 
 # ---------------------------------------------------------------------------
+# 15M momentum monitor + quick exits
+# ---------------------------------------------------------------------------
+
+QUICK_PROFIT_R       = 0.8    # Close if uPnL ≥ 0.8R within any cycle
+TIME_EXIT_HOURS      = 6      # Close if held longer than this …
+TIME_EXIT_MIN_R      = 0.3    # … and profit is below this R multiple
+FUNDING_SPIKE_PCT    = 0.0005 # ±0.05% funding rate triggers exit while in profit
+
+
+def check_15m_momentum(symbol: str, position_side: str) -> bool:
+    """
+    Return True if 15M momentum has reversed against the open position.
+    Requires BOTH: EMA9 cross AND RSI crossing 50.
+    """
+    df = get_klines(symbol, "15", limit=60)
+    if df is None or len(df) < 20:
+        return False
+
+    close = df["close"]
+    ema9  = ta.trend.EMAIndicator(close, window=9).ema_indicator()
+    rsi   = ta.momentum.RSIIndicator(close, window=14).rsi()
+
+    c_close, p_close = close.iloc[-1], close.iloc[-2]
+    c_ema9,  p_ema9  = ema9.iloc[-1],  ema9.iloc[-2]
+    c_rsi,   p_rsi   = rsi.iloc[-1],   rsi.iloc[-2]
+
+    if position_side == "Buy":
+        # Bearish: price crosses below EMA9 AND RSI crosses below 50
+        ema_cross = p_close >= p_ema9 and c_close < c_ema9
+        rsi_flip  = p_rsi >= 50 and c_rsi < 50
+    else:
+        # Bullish: price crosses above EMA9 AND RSI crosses above 50
+        ema_cross = p_close <= p_ema9 and c_close > c_ema9
+        rsi_flip  = p_rsi <= 50 and c_rsi > 50
+
+    return ema_cross and rsi_flip
+
+
+def manage_quick_exits(position_details: list) -> dict[str, bool]:
+    """
+    Check every open position for quick-exit conditions each cycle:
+
+    1. 0.8R profit reached → close immediately
+    2. 15M EMA9 cross + RSI flip → momentum exit
+    3. Funding rate spikes ≥ ±0.05% while position is in profit → close
+    4. Held > 6 hours with < 0.3R profit → time exit
+
+    Returns {symbol: True} for every position that was closed.
+    """
+    closed: dict[str, bool] = {}
+    now_ms = int(time.time() * 1000)
+
+    for pos in position_details:
+        symbol = pos["symbol"]
+        side   = pos["side"]
+        qty    = float(pos.get("size", 0))
+        entry  = float(pos.get("avgPrice", 0) or 0)
+        sl     = float(pos.get("stopLoss", 0) or 0)
+        upnl   = float(pos.get("unrealisedPnl", 0) or 0)
+        created_ms = int(pos.get("createdTime", now_ms) or now_ms)
+
+        if entry == 0 or qty == 0:
+            continue
+
+        risk_dist = abs(entry - sl) if sl != 0 else 0.0
+        r_usdt    = risk_dist * qty          # 1R in USDT
+        hours_held = (now_ms - created_ms) / 3_600_000
+
+        exit_reason: Optional[str] = None
+
+        # ── 1. Quick profit: ≥ 0.8R ────────────────────────────────────────
+        if r_usdt > 0 and upnl >= QUICK_PROFIT_R * r_usdt:
+            exit_reason = f"0.8R profit (`{upnl:.2f}` USDT ≥ `{QUICK_PROFIT_R * r_usdt:.2f}`)"
+
+        # ── 2. 15M momentum shift ───────────────────────────────────────────
+        if exit_reason is None:
+            if check_15m_momentum(symbol, side):
+                exit_reason = "15M momentum shift (EMA9 cross + RSI flip)"
+
+        # ── 3. Funding rate spike while in profit ───────────────────────────
+        if exit_reason is None and upnl > 0:
+            funding = get_funding_rate(symbol)
+            if funding is not None and abs(funding) >= FUNDING_SPIKE_PCT:
+                exit_reason = f"funding spike `{funding * 100:.4f}%` while in profit"
+
+        # ── 4. Time exit: > 6 h with < 0.3R profit ─────────────────────────
+        if exit_reason is None:
+            if hours_held > TIME_EXIT_HOURS and r_usdt > 0 and upnl < TIME_EXIT_MIN_R * r_usdt:
+                exit_reason = (
+                    f"time exit `{hours_held:.1f}h` held, "
+                    f"profit `{upnl:.2f}` < `{TIME_EXIT_MIN_R * r_usdt:.2f}` (0.3R)"
+                )
+
+        if exit_reason is None:
+            continue
+
+        pnl_str = f"+${upnl:.2f}" if upnl >= 0 else f"-${abs(upnl):.2f}"
+        direction_label = "LONG" if side == "Buy" else "SHORT"
+
+        log.warning(
+            "%s — QUICK EXIT [%s] | reason: %s | uPnL=%s | held=%.1fh",
+            symbol, direction_label, exit_reason, pnl_str, hours_held,
+        )
+
+        result = close_position(symbol, side, qty)
+        if result:
+            # Choose right emoji per reason
+            if "time exit" in exit_reason:
+                icon = "⏰"
+                label = "TIME EXIT"
+            elif "momentum" in exit_reason:
+                icon = "⚡"
+                label = "QUICK EXIT"
+            else:
+                icon = "⚡"
+                label = "QUICK EXIT"
+
+            discord_notify(
+                f"{icon} **{label} {direction_label} {symbol}** | "
+                f"{exit_reason} | PnL: `{pnl_str}` | Held: `{hours_held:.1f}h`"
+            )
+            closed[symbol] = True
+        else:
+            discord_notify(
+                f"⚠️ **{symbol}** — quick exit FAILED | reason: {exit_reason}"
+            )
+
+    return closed
+
+
+# ---------------------------------------------------------------------------
 # Signal scoring
 # ---------------------------------------------------------------------------
 
@@ -909,7 +1063,7 @@ def daily_loss_exceeded(starting_balance: float, current_balance: float) -> bool
 # ---------------------------------------------------------------------------
 
 
-def scan_symbol(symbol: str, balance: float, regime: str = "RANGE") -> Optional[dict]:
+def scan_symbol(symbol: str, balance: float, regime: Optional[dict] = None) -> Optional[dict]:
     """Analyse one symbol and return a trade dict if a signal fires, else None."""
     log.info("Scanning %s …", symbol)
 
@@ -940,20 +1094,30 @@ def scan_symbol(symbol: str, balance: float, regime: str = "RANGE") -> Optional[
         symbol, score, direction, details,
     )
 
-    # --- Regime filter ---
-    # BULL: only take Long (Buy) signals
-    if regime == "BULL" and direction == "Sell":
-        log.info("%s SKIP — BULL regime, no Short signals allowed.", symbol)
+    # --- Multi-timeframe regime filter ---
+    if regime is None:
+        regime = {"allowed": "SKIP", "threshold": 5, "regime_4h": "?", "regime_1h": "?"}
+
+    allowed   = regime.get("allowed", "SKIP")
+    threshold = regime.get("threshold", CONFLUENCE_THRESHOLD)
+
+    if allowed == "SKIP":
+        log.info(
+            "%s SKIP — regime conflict/range (4H=%s 1H=%s), no new entries.",
+            symbol, regime.get("regime_4h"), regime.get("regime_1h"),
+        )
         return None
-    # BEAR: only take Short (Sell) signals
-    if regime == "BEAR" and direction == "Buy":
-        log.info("%s SKIP — BEAR regime, no Long signals allowed.", symbol)
+    if allowed != direction:
+        log.info(
+            "%s SKIP — regime allows %s only, signal direction is %s.",
+            symbol, allowed, direction,
+        )
         return None
-    # RANGE: require higher confidence and reduce size
-    range_threshold = 5 if regime == "RANGE" else CONFLUENCE_THRESHOLD
-    if score < range_threshold:
-        if regime == "RANGE":
-            log.info("%s SKIP — RANGE regime requires score >=5, got %d.", symbol, score)
+    if score < threshold:
+        log.info(
+            "%s SKIP — score %d < required %d (4H=%s 1H=%s).",
+            symbol, score, threshold, regime.get("regime_4h"), regime.get("regime_1h"),
+        )
         return None
 
     entry = ind1h["close"]
@@ -1117,14 +1281,15 @@ def main():
             pos_count, MAX_OPEN_POSITIONS, list(open_positions.keys()), current_balance,
         )
 
-        # Run breakeven manager + reversal exit check on all open positions
+        # Run breakeven manager + all exit checks on all open positions
         if pos_count > 0:
             position_details = get_position_details()
             if position_details:
                 manage_breakeven(position_details)
-                closed_symbols = manage_reversals(position_details)
-                if closed_symbols:
-                    # Refresh position count after forced exits
+                closed_rev   = manage_reversals(position_details)
+                closed_quick = manage_quick_exits(position_details)
+                if closed_rev or closed_quick:
+                    # Refresh position count after any forced exits
                     open_positions = get_open_positions()
                     pos_count = len(open_positions)
 
@@ -1193,8 +1358,9 @@ def main():
 
         next_scan = datetime.datetime.utcnow() + datetime.timedelta(seconds=SCAN_INTERVAL_SECONDS)
         log.info("Scan complete. Next scan at %s UTC", next_scan.strftime("%H:%M:%S"))
+        regime_label = f"{regime.get('regime_4h','?')}/{regime.get('regime_1h','?')} → {regime.get('allowed','?')}"
         discord_notify(
-            f"📊 **Scan complete** | Regime: `{regime}` | "
+            f"📊 **Scan complete** | Regime: `{regime_label}` | "
             f"Positions: `{len(open_positions)}/{MAX_OPEN_POSITIONS}` | "
             f"Balance: `{current_balance:.2f}` USDT | "
             f"Next scan: `{next_scan.strftime('%H:%M')} UTC`"
