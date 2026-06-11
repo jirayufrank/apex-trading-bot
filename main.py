@@ -781,53 +781,8 @@ def check_reversal_signals(symbol: str, position_side: str, df: pd.DataFrame) ->
     return len(signals), signals
 
 
-def manage_reversals(position_details: list) -> dict[str, bool]:
-    """
-    For every open position, run the reversal signal check on 1H data.
-    Closes any position where ≥3 reversal signals fire.
-    Returns a dict {symbol: True} for each position that was closed.
-    """
-    EXIT_THRESHOLD = 3
-    closed: dict[str, bool] = {}
-
-    for pos in position_details:
-        symbol = pos["symbol"]
-        side   = pos["side"]        # "Buy" or "Sell"
-        qty    = float(pos["size"])
-        entry  = float(pos.get("avgPrice", 0))
-        mark   = float(pos.get("markPrice", 0))
-        upnl   = float(pos.get("unrealisedPnl", 0))
-
-        df1h = get_klines(symbol, "60", limit=100)
-        if df1h is None or len(df1h) < 3:
-            log.warning("%s — could not fetch 1H klines for reversal check", symbol)
-            continue
-
-        count, fired = check_reversal_signals(symbol, side, df1h)
-        if count < EXIT_THRESHOLD:
-            continue
-
-        log.warning(
-            "%s — EXIT triggered: %d/5 reversal signals (%s). Closing %s qty=%s entry=%.4f mark=%.4f uPnL=%.2f",
-            symbol, count, fired, side, qty, entry, mark, upnl,
-        )
-        result = close_position(symbol, side, qty)
-        if result:
-            pnl_str = f"+${upnl:.2f}" if upnl >= 0 else f"-${abs(upnl):.2f}"
-            direction = "LONG" if side == "Buy" else "SHORT"
-            discord_notify(
-                f"🔔 **EXIT {direction} {symbol}** | Reversal `{count}/5` signals "
-                f"[{', '.join(fired)}] | PnL: `{pnl_str}`"
-            )
-            closed[symbol] = True
-        else:
-            discord_notify(f"⚠️ **{symbol}** — reversal exit order FAILED ({count}/5 signals)")
-
-    return closed
-
-
 # ---------------------------------------------------------------------------
-# 15M momentum monitor + quick exits
+# Unified exit manager (replaces manage_reversals + manage_quick_exits)
 # ---------------------------------------------------------------------------
 
 QUICK_PROFIT_R       = 0.8    # Close if uPnL ≥ 0.8R within any cycle
@@ -838,8 +793,13 @@ FUNDING_SPIKE_PCT    = 0.0005 # ±0.05% funding rate triggers exit while in prof
 
 def check_15m_momentum(symbol: str, position_side: str) -> bool:
     """
-    Return True if 15M momentum has reversed against the open position.
-    Requires BOTH: EMA9 cross AND RSI crossing 50.
+    Return True if 15M momentum reversal is CONFIRMED across 2 consecutive candles.
+
+    Requires both the current AND the previous 15M candle to show:
+      Long position → price < EMA9  AND  RSI < 50  (bearish)
+      Short position → price > EMA9  AND  RSI > 50  (bullish)
+
+    2-candle requirement eliminates single-candle false spikes.
     """
     df = get_klines(symbol, "15", limit=60)
     if df is None or len(df) < 20:
@@ -849,109 +809,133 @@ def check_15m_momentum(symbol: str, position_side: str) -> bool:
     ema9  = ta.trend.EMAIndicator(close, window=9).ema_indicator()
     rsi   = ta.momentum.RSIIndicator(close, window=14).rsi()
 
-    c_close, p_close = close.iloc[-1], close.iloc[-2]
-    c_ema9,  p_ema9  = ema9.iloc[-1],  ema9.iloc[-2]
-    c_rsi,   p_rsi   = rsi.iloc[-1],   rsi.iloc[-2]
-
     if position_side == "Buy":
-        # Bearish: price crosses below EMA9 AND RSI crosses below 50
-        ema_cross = p_close >= p_ema9 and c_close < c_ema9
-        rsi_flip  = p_rsi >= 50 and c_rsi < 50
+        # Bearish momentum must hold on both last 2 candles
+        candle_curr = close.iloc[-1] < ema9.iloc[-1] and rsi.iloc[-1] < 50
+        candle_prev = close.iloc[-2] < ema9.iloc[-2] and rsi.iloc[-2] < 50
     else:
-        # Bullish: price crosses above EMA9 AND RSI crosses above 50
-        ema_cross = p_close <= p_ema9 and c_close > c_ema9
-        rsi_flip  = p_rsi <= 50 and c_rsi > 50
+        # Bullish momentum must hold on both last 2 candles
+        candle_curr = close.iloc[-1] > ema9.iloc[-1] and rsi.iloc[-1] > 50
+        candle_prev = close.iloc[-2] > ema9.iloc[-2] and rsi.iloc[-2] > 50
 
-    return ema_cross and rsi_flip
+    confirmed = candle_curr and candle_prev
+    if confirmed:
+        log.info("%s — 15M momentum confirmed (2/2 candles) for %s position", symbol, position_side)
+    return confirmed
 
 
-def manage_quick_exits(position_details: list) -> dict[str, bool]:
+def manage_exits(position_details: list, regime: Optional[dict] = None) -> dict[str, bool]:
     """
-    Check every open position for quick-exit conditions each cycle:
+    Unified exit manager. Checks every open position in strict priority order
+    (SL is always first but handled by the exchange automatically):
 
-    1. 0.8R profit reached → close immediately
-    2. 15M EMA9 cross + RSI flip → momentum exit
-    3. Funding rate spikes ≥ ±0.05% while position is in profit → close
-    4. Held > 6 hours with < 0.3R profit → time exit
+      Priority 1 — 0.8R quick profit
+      Priority 2 — Dynamic reversal 3/5 signals (+ optional regime-conflict bonus)
+      Priority 3 — 15M momentum (2-candle confirmed)
+      Priority 4 — Funding rate spike while in profit
+      Priority 5 — Time exit (>6 h with <0.3R profit)
+
+    Regime-conflict rule: if the current regime conflicts with a position's
+    direction, +1 is added to its reversal score (but does NOT force close alone).
 
     Returns {symbol: True} for every position that was closed.
     """
+    EXIT_THRESHOLD = 3
     closed: dict[str, bool] = {}
     now_ms = int(time.time() * 1000)
 
     for pos in position_details:
-        symbol = pos["symbol"]
-        side   = pos["side"]
-        qty    = float(pos.get("size", 0))
-        entry  = float(pos.get("avgPrice", 0) or 0)
-        sl     = float(pos.get("stopLoss", 0) or 0)
-        upnl   = float(pos.get("unrealisedPnl", 0) or 0)
+        symbol     = pos["symbol"]
+        side       = pos["side"]
+        qty        = float(pos.get("size", 0))
+        entry      = float(pos.get("avgPrice", 0) or 0)
+        sl         = float(pos.get("stopLoss", 0) or 0)
+        upnl       = float(pos.get("unrealisedPnl", 0) or 0)
         created_ms = int(pos.get("createdTime", now_ms) or now_ms)
 
         if entry == 0 or qty == 0:
             continue
 
-        risk_dist = abs(entry - sl) if sl != 0 else 0.0
-        r_usdt    = risk_dist * qty          # 1R in USDT
+        risk_dist  = abs(entry - sl) if sl != 0 else 0.0
+        r_usdt     = risk_dist * qty
         hours_held = (now_ms - created_ms) / 3_600_000
+        pnl_str    = f"+${upnl:.2f}" if upnl >= 0 else f"-${abs(upnl):.2f}"
+        dlabel     = "LONG" if side == "Buy" else "SHORT"
 
         exit_reason: Optional[str] = None
+        icon  = "⚡"
+        label = "QUICK EXIT"
 
-        # ── 1. Quick profit: ≥ 0.8R ────────────────────────────────────────
+        # ── Priority 1: 0.8R quick profit ──────────────────────────────────
         if r_usdt > 0 and upnl >= QUICK_PROFIT_R * r_usdt:
-            exit_reason = f"0.8R profit (`{upnl:.2f}` USDT ≥ `{QUICK_PROFIT_R * r_usdt:.2f}`)"
+            exit_reason = f"0.8R profit (`{upnl:.2f}` ≥ `{QUICK_PROFIT_R * r_usdt:.2f}` USDT)"
 
-        # ── 2. 15M momentum shift ───────────────────────────────────────────
+        # ── Priority 2: Dynamic reversal 3/5 (+ regime-conflict bonus) ─────
+        if exit_reason is None:
+            df1h = get_klines(symbol, "60", limit=100)
+            if df1h is not None and len(df1h) >= 3:
+                rev_count, rev_fired = check_reversal_signals(symbol, side, df1h)
+
+                # Regime-conflict bonus: +1 if regime opposes position direction
+                regime_bonus = 0
+                if regime:
+                    allowed = regime.get("allowed", "SKIP")
+                    position_dir = "Buy" if side == "Buy" else "Sell"
+                    if allowed == "SKIP" or allowed != position_dir:
+                        regime_bonus = 1
+                        log.info(
+                            "%s — regime conflict bonus +1 (allowed=%s, pos=%s). "
+                            "Reversal: %d→%d/5 signals %s",
+                            symbol, allowed, position_dir,
+                            rev_count, rev_count + regime_bonus, rev_fired,
+                        )
+
+                if rev_count + regime_bonus >= EXIT_THRESHOLD:
+                    sig_list = rev_fired + (["RegimeConflict"] if regime_bonus else [])
+                    exit_reason = (
+                        f"reversal `{rev_count + regime_bonus}/5` "
+                        f"[{', '.join(sig_list)}]"
+                    )
+
+        # ── Priority 3: 15M momentum (2-candle confirmed) ──────────────────
         if exit_reason is None:
             if check_15m_momentum(symbol, side):
-                exit_reason = "15M momentum shift (EMA9 cross + RSI flip)"
+                exit_reason = "15M momentum (2-candle confirmed)"
 
-        # ── 3. Funding rate spike while in profit ───────────────────────────
+        # ── Priority 4: Funding rate spike while in profit ──────────────────
         if exit_reason is None and upnl > 0:
             funding = get_funding_rate(symbol)
             if funding is not None and abs(funding) >= FUNDING_SPIKE_PCT:
                 exit_reason = f"funding spike `{funding * 100:.4f}%` while in profit"
 
-        # ── 4. Time exit: > 6 h with < 0.3R profit ─────────────────────────
+        # ── Priority 5: Time exit ───────────────────────────────────────────
         if exit_reason is None:
             if hours_held > TIME_EXIT_HOURS and r_usdt > 0 and upnl < TIME_EXIT_MIN_R * r_usdt:
+                icon  = "⏰"
+                label = "TIME EXIT"
                 exit_reason = (
-                    f"time exit `{hours_held:.1f}h` held, "
-                    f"profit `{upnl:.2f}` < `{TIME_EXIT_MIN_R * r_usdt:.2f}` (0.3R)"
+                    f"held `{hours_held:.1f}h`, profit `{upnl:.2f}` "
+                    f"< `{TIME_EXIT_MIN_R * r_usdt:.2f}` USDT (0.3R)"
                 )
 
         if exit_reason is None:
             continue
 
-        pnl_str = f"+${upnl:.2f}" if upnl >= 0 else f"-${abs(upnl):.2f}"
-        direction_label = "LONG" if side == "Buy" else "SHORT"
-
         log.warning(
-            "%s — QUICK EXIT [%s] | reason: %s | uPnL=%s | held=%.1fh",
-            symbol, direction_label, exit_reason, pnl_str, hours_held,
+            "%s — %s [%s] | %s | uPnL=%s | held=%.1fh",
+            symbol, label, dlabel, exit_reason, pnl_str, hours_held,
         )
 
         result = close_position(symbol, side, qty)
         if result:
-            # Choose right emoji per reason
-            if "time exit" in exit_reason:
-                icon = "⏰"
-                label = "TIME EXIT"
-            elif "momentum" in exit_reason:
-                icon = "⚡"
-                label = "QUICK EXIT"
-            else:
-                icon = "⚡"
-                label = "QUICK EXIT"
-
             discord_notify(
-                f"{icon} **{label} {direction_label} {symbol}** | "
+                f"{icon} **{label} {dlabel} {symbol}** | "
                 f"{exit_reason} | PnL: `{pnl_str}` | Held: `{hours_held:.1f}h`"
             )
             closed[symbol] = True
         else:
             discord_notify(
-                f"⚠️ **{symbol}** — quick exit FAILED | reason: {exit_reason}"
+                f"⚠️ **{symbol}** — exit order FAILED | {exit_reason}"
             )
 
     return closed
@@ -1273,6 +1257,11 @@ def main():
             time.sleep(SCAN_INTERVAL_SECONDS)
             continue
 
+        # --- Regime fetched first so exit manager can use it ---
+        # (also used in scan loop below; fetched here so position exits see the
+        #  current regime even when max-positions early-exit skips the scan)
+        regime = get_market_regime()
+
         # --- Position check + breakeven management at start of every cycle ---
         open_positions = get_open_positions()
         pos_count = len(open_positions)
@@ -1281,14 +1270,13 @@ def main():
             pos_count, MAX_OPEN_POSITIONS, list(open_positions.keys()), current_balance,
         )
 
-        # Run breakeven manager + all exit checks on all open positions
+        # Run breakeven manager + unified exit checks (priority ordered)
         if pos_count > 0:
             position_details = get_position_details()
             if position_details:
                 manage_breakeven(position_details)
-                closed_rev   = manage_reversals(position_details)
-                closed_quick = manage_quick_exits(position_details)
-                if closed_rev or closed_quick:
+                closed = manage_exits(position_details, regime)
+                if closed:
                     # Refresh position count after any forced exits
                     open_positions = get_open_positions()
                     pos_count = len(open_positions)
@@ -1311,9 +1299,6 @@ def main():
 
         # Refresh instrument lot-size cache for any new symbols
         load_instrument_cache(watchlist)
-
-        # --- Market regime check (runs before every scan cycle) ---
-        regime = get_market_regime()
 
         for symbol in watchlist:
             # Hard cap check before each symbol
