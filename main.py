@@ -888,7 +888,10 @@ def main():
     threading.Thread(target=_start_http_server, daemon=True).start()
     if not API_KEY or not API_SECRET: log.error("API keys not set"); return
     starting_balance=get_account_balance()
-    if starting_balance is None: log.error("Balance fetch failed"); return
+    if starting_balance is None:
+    log.error("Balance fetch failed")
+    discord_notify("💀 **APEX Bot CRASHED** | Balance fetch failed — API key issue!")
+    return
     log.info("Starting balance: %.2f USDT", starting_balance)
 
     day_start=datetime.date.today()
