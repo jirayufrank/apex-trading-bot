@@ -352,7 +352,7 @@ def _signed_get(path: str, params: dict) -> Optional[dict]:
     return None
 
 def get_account_balance() -> Optional[float]:
-    data = _signed_get("/v5/account/wallet-balance", {"accountType":"CONTRACT","coin":"USDT"})
+    data = _signed_get("/v5/account/wallet-balance", {"accountType":"UNIFIED","coin":"USDT"})
     if data and data.get("retCode")==0:
         for item in data["result"]["list"]:
             for coin in item.get("coin",[]):
