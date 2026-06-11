@@ -329,13 +329,24 @@ def _post_headers(body: str) -> dict:
             "X-BAPI-RECV-WINDOW":rw,"X-BAPI-SIGN":sig,"Content-Type":"application/json"}
 
 def _signed_get(path: str, params: dict) -> Optional[dict]:
-    ts  = str(int(time.time()*1000))
+    ts  = str(int(time.time() * 1000))
     rw  = "5000"
-    qs  = "&".join(f"{k}={v}" for k,v in sorted(params.items()))
-    sig = hmac.new(API_SECRET.encode(), (ts+API_KEY+rw+qs).encode(), hashlib.sha256).hexdigest()
-    hdrs= {"X-BAPI-API-KEY":API_KEY,"X-BAPI-TIMESTAMP":ts,"X-BAPI-RECV-WINDOW":rw,"X-BAPI-SIGN":sig}
+    qs  = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+    sig = hmac.new(
+        API_SECRET.encode(), (ts + API_KEY + rw + qs).encode(), hashlib.sha256
+    ).hexdigest()
+    headers = {
+        "X-BAPI-API-KEY":     API_KEY,
+        "X-BAPI-TIMESTAMP":   ts,
+        "X-BAPI-RECV-WINDOW": rw,
+        "X-BAPI-SIGN":        sig,
+    }
     try:
-        return requests.get(f"{BASE_URL}{path}", headers=hdrs, params=params, timeout=10).json()
+        resp = requests.get(
+            f"{BASE_URL}{path}", headers=headers, params=params, timeout=10
+        )
+        resp.raise_for_status()
+        return resp.json()
     except Exception as e:
         log.error("GET %s: %s", path, e)
     return None
