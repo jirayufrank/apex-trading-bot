@@ -37,7 +37,7 @@ API_KEY             = os.environ.get("BYBIT_API_KEY", "")
 API_SECRET          = os.environ.get("BYBIT_API_SECRET", "")
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
 
-BASE_URL = "https://api.bytick.com"
+BASE_URL = "https://api.bybit.com"
 
 DYNAMIC_SCAN_TOP_N     = 50
 DYNAMIC_VOLUME_MIN_USD = 50_000_000
