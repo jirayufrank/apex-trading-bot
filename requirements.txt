@@ -1,0 +1,4 @@
+requests==2.34.2
+pandas==3.0.3
+numpy==2.4.6
+ta==0.11.0
