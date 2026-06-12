@@ -1,4 +1,3 @@
-cat > main.py << 'APEXEOF'
 #!/usr/bin/env python3
 """
 APEX Bybit Futures Trading Bot — v4.1 "Fast & Precise"
@@ -1471,5 +1470,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-APEXEOF
-git add main.py && git commit -m "v4.1 fast and precise" && git push
