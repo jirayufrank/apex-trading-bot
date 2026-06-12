@@ -1289,12 +1289,76 @@ def scan_symbol(symbol:str, balance:float, regime:Optional[dict]=None,
 
 HTTP_PORT = int(os.environ.get("PORT", 5000))
 
+HTTP_PORT    = int(os.environ.get("PORT", 5000))
+STATUS_TOKEN = os.environ.get("STATUS_TOKEN", "")
+BOT_STARTED_AT = datetime.datetime.utcnow().isoformat()
+
 class _PingHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        body=b"APEX Bot Running v4.1"
-        self.send_response(200); self.send_header("Content-Type","text/plain")
-        self.send_header("Content-Length",str(len(body))); self.end_headers()
+    def _send_json(self, obj, code=200):
+        body = json.dumps(obj, indent=2, default=str).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
         self.wfile.write(body)
+
+    def _authorized(self, query: str) -> bool:
+        if not STATUS_TOKEN:
+            return True
+        from urllib.parse import parse_qs
+        return parse_qs(query).get("token", [""])[0] == STATUS_TOKEN
+
+    def do_GET(self):
+        from urllib.parse import urlparse
+        parsed = urlparse(self.path)
+        try:
+            if parsed.path == "/status":
+                if not self._authorized(parsed.query):
+                    return self._send_json({"error": "unauthorized"}, 401)
+                journal   = load_journal()
+                completed = [t for t in journal if t.get("outcome") in ("win","loss")]
+                wins      = sum(1 for t in completed if t["outcome"]=="win")
+                open_trades = [
+                    {k: t.get(k) for k in ("symbol","direction","entry","sl","tp",
+                                           "qty","score","signals","timestamp","tp1_done")}
+                    for t in journal
+                    if t.get("outcome") is None and t.get("order_result")
+                ]
+                ls = load_learning_state()
+                self._send_json({
+                    "bot": "APEX v4.1", "status": "running",
+                    "started_at": BOT_STARTED_AT,
+                    "time_utc": datetime.datetime.utcnow().isoformat(),
+                    "balance_usdt": get_account_balance(),
+                    "open_positions": get_open_positions(),
+                    "open_trades_journal": open_trades,
+                    "completed_trades": len(completed),
+                    "wins": wins,
+                    "win_rate": round(wins/len(completed),3) if completed else None,
+                    "total_pnl_usdt": round(sum((t.get("pnl") or 0) for t in completed),4),
+                    "last_5_closed": [
+                        {k: t.get(k) for k in ("symbol","direction","outcome","pnl",
+                                               "exit_reason","closed_at")}
+                        for t in completed[-5:]
+                    ],
+                    "learning_last_updated": ls.get("last_updated"),
+                    "signal_weights": ls.get("signal_weights"),
+                })
+            elif parsed.path == "/journal":
+                if not self._authorized(parsed.query):
+                    return self._send_json({"error": "unauthorized"}, 401)
+                self._send_json(load_journal()[-20:])
+            else:
+                body = b"APEX Bot Running v4.1"
+                self.send_response(200)
+                self.send_header("Content-Type","text/plain")
+                self.send_header("Content-Length",str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+        except Exception as e:
+            try: self._send_json({"error": str(e)}, 500)
+            except Exception: pass
+
     def log_message(self,*a): pass
 
 def _start_http_server():
