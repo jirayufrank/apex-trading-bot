@@ -891,7 +891,10 @@ def _compute_regime(proxy: str) -> dict:
         if r1h=="BEAR":    allowed,thr="Sell",4
         elif r1h=="RANGE": allowed,thr="Sell",5
         else:              allowed,thr="SKIP",5
-    else: allowed,thr="SKIP",5
+    elif r4h=="RANGE":
+        if r1h=="BULL":    allowed,thr="Buy",5
+        elif r1h=="BEAR":  allowed,thr="Sell",5
+        else:              allowed,thr="SKIP",5
     log.info("REGIME [%s]: 4H=%s 1H=%s → %s thr=%d",proxy,r4h,r1h,allowed,thr)
     return {"regime_4h":r4h,"regime_1h":r1h,"allowed":allowed,"threshold":thr,"proxy":proxy}
 
