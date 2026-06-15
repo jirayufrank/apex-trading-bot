@@ -1246,7 +1246,17 @@ def scan_symbol(symbol:str, balance:float, regime:Optional[dict]=None,
             cands=[p for p in [pm,pl] if entry>p>=raw_tp*0.98]
             tp=max(cands) if cands else raw_tp
         sl=snap_price(symbol,sl); tp=snap_price(symbol,tp)
+# [RR] Minimum R:R check
+        risk   = abs(entry - sl)
+        reward = abs(tp - entry)
+        if risk <= 0 or reward / risk < 1.5:
+            log.info("%s SKIP R:R too low (%.2f)", symbol, reward/risk if risk>0 else 0)
+            return None
 
+        # [RR] SL must not be closer than 2% to entry
+        if abs(entry - sl) / entry < 0.02:
+            log.info("%s SKIP SL too tight", symbol)
+            return None
         qty=calculate_position(balance,entry,sl,leverage,score,symbol,learning_state)
         qty=snap_qty(symbol,qty)
         if qty<=0: return None
