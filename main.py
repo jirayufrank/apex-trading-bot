@@ -1100,8 +1100,10 @@ def manage_exits(position_details:list, regime:Optional[dict]=None) -> dict:
 
         if reason is None and upnl>0:
             fr=get_funding_rate(sym)
-            if fr is not None and abs(fr)>=FUNDING_SPIKE_PCT:
-                reason=f"funding spike `{fr*100:.4f}%`"
+            if fr is not None:
+                bad_funding = (side=="Buy" and fr>=FUNDING_SPIKE_PCT) or (side=="Sell" and fr<=-FUNDING_SPIKE_PCT)
+                if bad_funding:
+                    reason=f"funding spike `{fr*100:.4f}%`"
 
         if reason is None:
             if hrs>TIME_EXIT_HOURS and r_usdt>0 and upnl<TIME_EXIT_MIN_R*r_usdt:
