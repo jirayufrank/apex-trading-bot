@@ -1075,6 +1075,7 @@ def manage_exits(position_details:list, regime:Optional[dict]=None) -> dict:
             r_usdt = rd*qty
 
         hrs=(now_ms-created_ms)/3_600_000
+        if created_ms==0 or hrs<1: log.info("%s SKIP time-exit check (just opened)",sym); continue
         pnl_str=f"+${upnl:.2f}" if upnl>=0 else f"-${abs(upnl):.2f}"
         dlabel="LONG" if side=="Buy" else "SHORT"
         reason=None; icon="⚡"; label="QUICK EXIT"
