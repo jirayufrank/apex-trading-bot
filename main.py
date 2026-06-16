@@ -1238,11 +1238,11 @@ def scan_symbol(symbol:str, balance:float, regime:Optional[dict]=None,
         if price is None: return None
         entry=snap_price(symbol,price)
         if direction=="Buy":
-            sl=entry-2*atr; raw_tp=entry+4*atr
+            sl=entry-2*atr; raw_tp=entry+6*atr
             cands=[p for p in [pm,ph] if entry<p<=raw_tp*1.02]
             tp=min(cands) if cands else raw_tp
         else:
-            sl=entry+2*atr; raw_tp=entry-4*atr
+            sl=entry+2*atr; raw_tp=entry-6*atr
             cands=[p for p in [pm,pl] if entry>p>=raw_tp*0.98]
             tp=max(cands) if cands else raw_tp
         sl=snap_price(symbol,sl); tp=snap_price(symbol,tp)
