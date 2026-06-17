@@ -984,6 +984,27 @@ def get_market_regime() -> dict: return _compute_regime("BTCUSDT")
 def get_symbol_regime(symbol: str) -> dict:
     return _compute_regime("XAUTUSDT" if "XAU" in symbol else "BTCUSDT")
 
+def _symbol_regime_from_df(df4h_c: pd.DataFrame, df1h_c: pd.DataFrame) -> dict:
+    """[R1] A symbol's OWN regime, computed from candles already loaded in the
+    scan (no extra API call). The symbol decides its own direction; BTC is used
+    only as a risk veto in scan_symbol. This unblocks good coin setups on days
+    when BTC itself is sideways."""
+    r4h = _classify_ema(df4h_c["close"])
+    r1h = _classify_ema(df1h_c["close"]) if len(df1h_c) >= 50 else "RANGE"
+    if r4h == "BULL":
+        if r1h == "BULL":    allowed, thr = "Buy", 4
+        elif r1h == "RANGE": allowed, thr = "Buy", 5
+        else:                allowed, thr = "SKIP", 5
+    elif r4h == "BEAR":
+        if r1h == "BEAR":    allowed, thr = "Sell", 4
+        elif r1h == "RANGE": allowed, thr = "Sell", 5
+        else:                allowed, thr = "SKIP", 5
+    else:  # 4H RANGE — only follow a clear 1H push
+        if r1h == "BULL":    allowed, thr = "Buy", 5
+        elif r1h == "BEAR":  allowed, thr = "Sell", 5
+        else:                allowed, thr = "SKIP", 5
+    return {"regime_4h": r4h, "regime_1h": r1h, "allowed": allowed, "threshold": thr}
+
 
 # ---------------------------------------------------------------------------
 # [E1] Entry scoring — coherent TREND + TIMING model
@@ -1430,15 +1451,34 @@ def scan_symbol(symbol:str, balance:float, regime:Optional[dict]=None,
     if direction=="Buy"  and not LONG_ENABLED:  return None
     if direction=="Sell" and not SHORT_ENABLED: return None
 
-    # Regime gate (+ per-coin auto-threshold from learning)
-    sr=get_symbol_regime(symbol)
-    allowed=sr.get("allowed","SKIP"); thr=float(sr.get("threshold",CONFLUENCE_THRESHOLD))
+    # [R1] Regime gate — the SYMBOL decides direction; BTC is only a risk veto.
+    sr = _symbol_regime_from_df(df4h_c, df1h_c)
+    allowed = sr.get("allowed", "SKIP"); thr = float(sr.get("threshold", CONFLUENCE_THRESHOLD))
+
+    # the coin itself must have a tradeable trend in the signal's direction
+    if allowed == "SKIP" or allowed != direction:
+        log.info("%s SKIP coin regime (%s/%s -> %s vs %s)",
+                 symbol, sr.get("regime_4h"), sr.get("regime_1h"), allowed, direction)
+        return None
+
+    # BTC veto (skip for gold, which is uncorrelated). regime = BTC market regime.
+    btc4 = (regime or {}).get("regime_4h", "RANGE")
+    if "XAU" not in symbol:
+        if direction == "Buy" and btc4 == "BEAR":
+            log.info("%s VETO long — BTC 4H BEAR", symbol); return None
+        if direction == "Sell" and btc4 == "BULL":
+            log.info("%s VETO short — BTC 4H BULL", symbol); return None
+        # BTC undecided → require a slightly stronger coin setup
+        if btc4 == "RANGE":
+            thr += 0.5
+        log.info("%s coin %s/%s | BTC 4H=%s | thr=%.1f",
+                 symbol, sr.get("regime_4h"), sr.get("regime_1h"), btc4, thr)
+
+    # per-coin auto-threshold from learning
     if learning_state:
         prof=learning_state.get("coin_profiles",{}).get(symbol,{})
         sb=prof.get("score_bonus",0); thr+=sb
         if sb!=0: log.info("%s coin auto-thr %+d -> %.1f",symbol,sb,thr)
-    if allowed=="SKIP" or allowed!=direction:
-        log.info("%s SKIP regime (%s vs %s)",symbol,allowed,direction); return None
 
     # [E2] Extension guard (hard) — never chase price far from value
     if meta.get("ext",99)>MAX_EXTENSION_ATR:
@@ -1555,7 +1595,8 @@ def scan_symbol(symbol:str, balance:float, regime:Optional[dict]=None,
     discord_notify(
         f"{emoji} **{dlabel} {symbol}** ({mode})\n"
         f"Score `{score:.1f}/6` [{', '.join(details)}]\n"
-        f"Regime 4H/1H: `{sr.get('regime_4h','?')}/{sr.get('regime_1h','?')}`\n"
+        f"Coin regime 4H/1H: `{sr.get('regime_4h','?')}/{sr.get('regime_1h','?')}` | "
+        f"BTC 4H: `{(regime or {}).get('regime_4h','?')}`\n"
         f"Entry `{entry}` | SL `{sl}` (`{sl_pct:+.1f}%`) | TP `{tp}` (`{tp_pct:+.1f}%`)\n"
         f"R:R `{rr:.2f}` | Ext `{meta.get('ext',0):.1f}` ATR | Lev `{leverage}x`"
         f"{liq_txt}\n"
