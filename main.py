@@ -167,6 +167,8 @@ MAX_SPREAD_PCT = 0.0015
 QUICK_PROFIT_R    = 0.8               # STALL exit threshold (needs reversal too)
 TIME_EXIT_HOURS   = 6
 TIME_EXIT_MIN_R   = 0.3
+REOPEN_COOLDOWN_HRS = float(os.environ.get("REOPEN_COOLDOWN_HRS", "2"))  # [X1] no re-fire same coin
+SETTLE_MINUTES      = float(os.environ.get("SETTLE_MINUTES", "25"))      # [X3] weak exits gated until trade settles; strong reversal always acts
 FUNDING_SPIKE_PCT = 0.0005
 FUNDING_RATE_MAX  = 0.001
 FUNDING_RATE_MIN  = -0.001
@@ -1246,17 +1248,24 @@ def manage_exits(position_details:list, regime:Optional[dict]=None) -> dict:
             r_usdt = rd*qty
         r_mult = (upnl / r_usdt) if r_usdt > 0 else 0.0
 
-        hrs=(now_ms-created_ms)/3_600_000
-        if created_ms==0 or hrs<1:
-            log.info("%s SKIP exit checks (just opened)",sym); continue
-
         journal, ji = _find_open_trade(sym, side)
         tp1_done = (ji >= 0 and bool(journal[ji].get("tp1_done")))
+
+        # [X2] Holding time from OUR journal open-timestamp (Bybit createdTime
+        # reads stale on re-opened symbols -> previously fired TIME EXIT in minutes).
+        opened_ms = _ts_to_ms(journal[ji].get("timestamp","")) if ji >= 0 else 0
+        if not opened_ms:
+            opened_ms = created_ms
+        hrs = (now_ms-opened_ms)/3_600_000 if opened_ms else 0.0
+        age_min = hrs*60
+        if opened_ms==0:
+            log.info("%s SKIP exit checks (open time unknown)",sym); continue
 
         pnl_str=f"+${upnl:.2f}" if upnl>=0 else f"-${abs(upnl):.2f}"
         dlabel="LONG" if side=="Buy" else "SHORT"
         reason=None; icon="⚡"; label="EXIT"
 
+        # Evidence the entry thesis is breaking (closed-candle reversal + regime).
         rc=0; rf=[]
         df1h=get_klines(sym,"60",limit=100)
         if df1h is not None and len(df1h)>=4:
@@ -1266,33 +1275,44 @@ def manage_exits(position_details:list, regime:Optional[dict]=None) -> dict:
             al=regime.get("allowed","SKIP")
             if al=="SKIP" or al!=side: rb=1
         rev_list = rf + (["RegimeConflict"] if rb else [])
+        rev_score  = rc+rb
+        strong_rev = rev_score >= RUNNER_EXIT_THRESHOLD   # 4/5 = thesis clearly broken
+        settled    = age_min >= SETTLE_MINUTES            # weak signals wait for settle
 
         if tp1_done:
             # RUNNER: breakeven protects it. Exit only on STRONG reversal or long-flat.
-            if rc+rb >= RUNNER_EXIT_THRESHOLD:
+            if strong_rev:
                 icon="🔄"; label="RUNNER EXIT"
-                reason=f"strong reversal `{rc+rb}/5` [{', '.join(rev_list)}]"
+                reason=f"strong reversal `{rev_score}/5` [{', '.join(rev_list)}]"
             elif hrs>RUNNER_TIME_EXIT_HRS and r_mult<0.5:
                 icon="⏰"; label="RUNNER TIME"
                 reason=f"runner flat `{hrs:.1f}h` (<0.5R) — freeing slot"
         else:
-            # PRE-TP1 (full position)
-            if rc+rb >= PRE_TP1_REVERSAL:
-                reason=f"reversal `{rc+rb}/5` [{', '.join(rev_list)}]"
-            if reason is None and check_15m_momentum(sym,side):
-                icon="📉"; label="MOMENTUM EXIT"; reason="15M momentum flip (3-candle)"
-            if reason is None and upnl>0:
-                fr=get_funding_rate(sym)
-                if fr is not None:
-                    bad=(side=="Buy" and fr>=FUNDING_SPIKE_PCT) or (side=="Sell" and fr<=-FUNDING_SPIKE_PCT)
-                    if bad:
-                        icon="💸"; label="FUNDING EXIT"; reason=f"funding spike `{fr*100:.4f}%`"
-            # STALL exit (replaces blind 0.8R grab): needs profit AND a reversal
-            if reason is None and r_mult>=QUICK_PROFIT_R and (rc+rb)>=2:
-                icon="🛟"; label="STALL EXIT"
-                reason=f"`{r_mult:.1f}R` + early reversal `{rc+rb}/5` — locking profit"
-            if reason is None and hrs>TIME_EXIT_HOURS and r_mult<TIME_EXIT_MIN_R:
-                icon="⏰"; label="TIME EXIT"; reason=f"held `{hrs:.1f}h` profit `{r_mult:.1f}R`<0.3R"
+            # PRE-TP1. A STRONG reversal (4/5 on closed candles) means the thesis
+            # is genuinely broken — honour it at ANY age, it is not entry noise.
+            if strong_rev:
+                reason=f"strong reversal `{rev_score}/5` [{', '.join(rev_list)}]"
+            elif settled:
+                # Weaker evidence only acts once the trade has had room to work.
+                if rev_score >= PRE_TP1_REVERSAL:
+                    reason=f"reversal `{rev_score}/5` [{', '.join(rev_list)}]"
+                if reason is None and check_15m_momentum(sym,side):
+                    icon="📉"; label="MOMENTUM EXIT"; reason="15M momentum flip (3-candle)"
+                if reason is None and upnl>0:
+                    fr=get_funding_rate(sym)
+                    if fr is not None:
+                        bad=(side=="Buy" and fr>=FUNDING_SPIKE_PCT) or (side=="Sell" and fr<=-FUNDING_SPIKE_PCT)
+                        if bad:
+                            icon="💸"; label="FUNDING EXIT"; reason=f"funding spike `{fr*100:.4f}%`"
+                # STALL exit (replaces blind 0.8R grab): needs profit AND a reversal
+                if reason is None and r_mult>=QUICK_PROFIT_R and rev_score>=2:
+                    icon="🛟"; label="STALL EXIT"
+                    reason=f"`{r_mult:.1f}R` + early reversal `{rev_score}/5` — locking profit"
+                if reason is None and hrs>TIME_EXIT_HOURS and r_mult<TIME_EXIT_MIN_R:
+                    icon="⏰"; label="TIME EXIT"; reason=f"held `{hrs:.1f}h` profit `{r_mult:.1f}R`<0.3R"
+            else:
+                log.info("%s settling (%.0fm/%.0fm) rev=%d/5 — only strong reversal acts",
+                         sym, age_min, SETTLE_MINUTES, rev_score)
 
         if reason is None: continue
         log.warning("%s — %s [%s] | %s | uPnL=%s | %.1fR | held=%.1fh",
@@ -1827,9 +1847,20 @@ def main():
                         load_instrument_cache(wl)
                 wl=_wl_cache["wl"]
 
+                # [X1] Re-open cooldown: don't re-fire a coin we just closed.
+                _now_ms=int(time.time()*1000); _cd_ms=REOPEN_COOLDOWN_HRS*3_600_000
+                _last_close={}
+                for _t in load_journal():
+                    if _t.get("outcome") in ("win","loss") and _t.get("closed_at"):
+                        _ms=_ts_to_ms(_t.get("closed_at",""))
+                        _s=_t.get("symbol","")
+                        if _ms>_last_close.get(_s,0): _last_close[_s]=_ms
+
                 for sym in wl:
                     if len(op)>=MAX_OPEN_POSITIONS: break
                     if sym in op: continue
+                    if _now_ms-_last_close.get(sym,0) < _cd_ms:
+                        log.info("%s SKIP cooldown (closed <%.0fh ago)",sym,REOPEN_COOLDOWN_HRS); continue
                     fr=get_funding_rate(sym)
                     if fr is None: continue
                     if not (FUNDING_RATE_MIN<=fr<=FUNDING_RATE_MAX): continue
