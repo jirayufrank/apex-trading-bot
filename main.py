@@ -169,6 +169,16 @@ TIME_EXIT_HOURS   = 6
 TIME_EXIT_MIN_R   = 0.3
 REOPEN_COOLDOWN_HRS = float(os.environ.get("REOPEN_COOLDOWN_HRS", "2"))  # [X1] no re-fire same coin
 SETTLE_MINUTES      = float(os.environ.get("SETTLE_MINUTES", "25"))      # [X3] weak exits gated until trade settles; strong reversal always acts
+
+# [BO] Breakout momentum mode — independent asymmetric path (low win-rate, runner-driven).
+# Fully self-contained: set BREAKOUT_ENABLED=false to disable and behave exactly like before.
+BREAKOUT_ENABLED        = os.environ.get("BREAKOUT_ENABLED", "true").lower() == "true"
+BREAKOUT_LOOKBACK       = int(os.environ.get("BREAKOUT_LOOKBACK", "20"))      # 1H bars defining the range high/low
+BREAKOUT_VOL_MULT       = float(os.environ.get("BREAKOUT_VOL_MULT", "1.5"))   # breakout bar volume must exceed avg * this
+BREAKOUT_RISK_PCT       = float(os.environ.get("BREAKOUT_RISK_PCT", "0.01"))  # 1% risk per breakout trade (half of pullback)
+BREAKOUT_SL_BUFFER_ATR  = float(os.environ.get("BREAKOUT_SL_BUFFER_ATR", "0.5"))  # SL sits this far below the broken level
+BREAKOUT_TRAIL_LOOKBACK = int(os.environ.get("BREAKOUT_TRAIL_LOOKBACK", "3"))     # swing low/high bars the trail rides under
+BREAKOUT_TP_ATR         = float(os.environ.get("BREAKOUT_TP_ATR", "12"))      # far safety-net TP only; the trail does the real exit work
 FUNDING_SPIKE_PCT = 0.0005
 FUNDING_RATE_MAX  = 0.001
 FUNDING_RATE_MIN  = -0.001
@@ -1261,6 +1271,32 @@ def manage_exits(position_details:list, regime:Optional[dict]=None) -> dict:
         if opened_ms==0:
             log.info("%s SKIP exit checks (open time unknown)",sym); continue
 
+        # [BO] Breakout positions ride a pure structural trail: ratchet the SL
+        # under the most recent swing (no TP1, no reversal/settle/time logic) so
+        # the rare winner can run as far as the trend allows. Bybit closes it
+        # when the trailing SL is hit.
+        if ji >= 0 and journal[ji].get("entry_mode") == "breakout":
+            try:
+                _raw = get_klines(sym, "60")
+                if _raw is not None:
+                    _df1h = _closed(_raw)
+                    _atr = float(ta.volatility.AverageTrueRange(
+                        _df1h["high"], _df1h["low"], _df1h["close"], window=14
+                    ).average_true_range().iloc[-1])
+                    _win = _df1h.iloc[-BREAKOUT_TRAIL_LOOKBACK:]
+                    _px  = float(_df1h["close"].iloc[-1])
+                    if side == "Buy":
+                        _new = snap_price(sym, float(_win["low"].min()) - BREAKOUT_SL_BUFFER_ATR*_atr)
+                        if _new > sl and _new < _px and set_breakeven_sl(sym, _new):
+                            log.info("%s BO trail SL %.4f -> %.4f (R=%.2f)", sym, sl, _new, r_mult)
+                    else:
+                        _new = snap_price(sym, float(_win["high"].max()) + BREAKOUT_SL_BUFFER_ATR*_atr)
+                        if (sl == 0 or _new < sl) and _new > _px and set_breakeven_sl(sym, _new):
+                            log.info("%s BO trail SL %.4f -> %.4f (R=%.2f)", sym, sl, _new, r_mult)
+            except Exception as e:
+                log.error("%s BO trail error: %s", sym, e)
+            continue
+
         pnl_str=f"+${upnl:.2f}" if upnl>=0 else f"-${abs(upnl):.2f}"
         dlabel="LONG" if side=="Buy" else "SHORT"
         reason=None; icon="⚡"; label="EXIT"
@@ -1591,6 +1627,7 @@ def scan_symbol(symbol:str, balance:float, regime:Optional[dict]=None,
     trade={
         "timestamp":   datetime.datetime.utcnow().isoformat(),
         "symbol":      symbol, "direction": direction,
+        "entry_mode":  "pullback",
         "score":       round(score,3), "signals": details,
         "entry":       entry, "sl": sl, "tp": tp,
         "qty":         qty, "leverage": leverage, "rr": round(rr,2),
@@ -1622,6 +1659,162 @@ def scan_symbol(symbol:str, balance:float, regime:Optional[dict]=None,
         f"{liq_txt}\n"
         f"Qty `{qty}` | Risk `{risk_usdt:.2f}` USDT (`{risk_pct_used*100:.1f}%`)"
         f"{news_txt}"
+    )
+    return trade
+
+
+# ---------------------------------------------------------------------------
+# [BO] Breakout momentum module — fully independent of the pullback pipeline.
+#   Pullback enters on a retrace to value (low ext). Breakout enters when price
+#   PUSHES THROUGH a 20-bar range high/low on above-average volume — it leads
+#   the trend instead of waiting for EMAs to stack. Deliberately skips the
+#   extension guard (a breakout IS extended by nature), but is held in check by
+#   tighter rules: volume confirmation, a closed bar beyond the level, BTC veto,
+#   half risk (1%), a structural SL just inside the broken level, and a pure
+#   trailing exit (no fixed TP) so the rare winner can run far enough to pay for
+#   the many small losers. entry_mode="breakout" keeps its journal separate.
+# ---------------------------------------------------------------------------
+
+def detect_breakout(df4h_c: pd.DataFrame, df1h_c: pd.DataFrame):
+    """Return (direction, signals, ref_level) on a confirmed 1H range break, else None."""
+    if len(df1h_c) < BREAKOUT_LOOKBACK + 2 or len(df4h_c) < 51:
+        return None
+    window     = df1h_c.iloc[-(BREAKOUT_LOOKBACK + 1):-1]          # prior N bars, excl. just-closed
+    range_high = float(window["high"].max())
+    range_low  = float(window["low"].min())
+    vol_avg    = float(window["volume"].mean())
+    last_close = float(df1h_c["close"].iloc[-1])
+    last_vol   = float(df1h_c["volume"].iloc[-1])
+    if vol_avg <= 0:
+        return None
+    vol_x  = last_vol / vol_avg
+    vol_ok = vol_x >= BREAKOUT_VOL_MULT
+
+    # 4H direction filter — don't break out straight into the higher-TF trend.
+    close4   = float(df4h_c["close"].iloc[-1])
+    ema50_4  = float(df4h_c["close"].ewm(span=50, adjust=False).mean().iloc[-1])
+
+    if last_close > range_high and vol_ok and close4 >= ema50_4:
+        return "Buy", [f"BO_long", f"Vol{vol_x:.1f}x", f"Range{BREAKOUT_LOOKBACK}"], range_high
+    if last_close < range_low and vol_ok and close4 <= ema50_4:
+        return "Sell", [f"BO_short", f"Vol{vol_x:.1f}x", f"Range{BREAKOUT_LOOKBACK}"], range_low
+    return None
+
+
+def scan_symbol_breakout(symbol: str, balance: float, regime: Optional[dict] = None,
+                         learning_state: Optional[dict] = None) -> Optional[dict]:
+    if not BREAKOUT_ENABLED:
+        return None
+
+    sp = get_spread_pct(symbol)
+    if sp is not None and sp > MAX_SPREAD_PCT:
+        return None
+
+    df4h = get_klines(symbol, "240"); df1h = get_klines(symbol, "60")
+    if df4h is None or df1h is None or len(df4h) < 51 or len(df1h) < BREAKOUT_LOOKBACK + 2:
+        return None
+    df4h_c = _closed(df4h); df1h_c = _closed(df1h)
+
+    bo = detect_breakout(df4h_c, df1h_c)
+    if bo is None:
+        return None
+    direction, signals, ref_level = bo
+
+    if direction == "Buy"  and not LONG_ENABLED:  return None
+    if direction == "Sell" and not SHORT_ENABLED: return None
+
+    # ATR for SL buffer / TP net
+    try:
+        atr = float(ta.volatility.AverageTrueRange(
+            df1h_c["high"], df1h_c["low"], df1h_c["close"], window=14
+        ).average_true_range().iloc[-1])
+    except Exception:
+        return None
+    if not atr or atr <= 0 or math.isnan(atr):
+        return None
+
+    # BTC veto — never break out against the market leader (gold exempt).
+    btc4 = (regime or {}).get("regime_4h", "RANGE")
+    if "XAU" not in symbol:
+        if direction == "Buy"  and btc4 == "BEAR":
+            log.info("%s BO VETO long — BTC 4H BEAR", symbol); return None
+        if direction == "Sell" and btc4 == "BULL":
+            log.info("%s BO VETO short — BTC 4H BULL", symbol); return None
+
+    # News gate (reuse) — avoid breaking out into a fresh-headline whipsaw.
+    nf = news_flag(symbol)
+    if nf["breaking"] and nf["age_h"] * 60 < NEWS_BLOCK_MINUTES:
+        log.info("%s BO SKIP fresh news %.0fmin", symbol, nf["age_h"] * 60); return None
+
+    price = get_best_price(symbol, direction)
+    if price is None: return None
+    entry = snap_price(symbol, price)
+
+    # Structural SL just inside the level that was broken.
+    if direction == "Buy":
+        sl = snap_price(symbol, ref_level - BREAKOUT_SL_BUFFER_ATR * atr)
+        tp = snap_price(symbol, entry + BREAKOUT_TP_ATR * atr)
+        if sl >= entry: log.info("%s BO SKIP SL>=entry", symbol); return None
+    else:
+        sl = snap_price(symbol, ref_level + BREAKOUT_SL_BUFFER_ATR * atr)
+        tp = snap_price(symbol, entry - BREAKOUT_TP_ATR * atr)
+        if sl <= entry: log.info("%s BO SKIP SL<=entry", symbol); return None
+
+    sl_dist = abs(entry - sl)
+    if sl_dist <= 0: return None
+    if sl_dist / entry < SL_MIN_DIST_PCT:
+        log.info("%s BO SKIP SL too tight (%.2f%%)", symbol, sl_dist/entry*100); return None
+
+    leverage = safe_leverage_for_sl(entry, sl)
+    set_leverage(symbol, leverage)
+    if not sl_inside_liq(entry, sl, direction, leverage):
+        leverage = safe_leverage_for_sl(entry, sl); set_leverage(symbol, leverage)
+        if not sl_inside_liq(entry, sl, direction, leverage):
+            log.info("%s BO SKIP SL beyond liq", symbol); return None
+
+    # Risk-based sizing at the (smaller) breakout risk budget.
+    qty_usdt = min((balance * BREAKOUT_RISK_PCT / sl_dist) * entry, balance * leverage)
+    qty = snap_qty(symbol, qty_usdt / entry)
+    if qty <= 0:
+        log.info("%s BO SKIP qty 0", symbol); return None
+
+    log.info("%s BREAKOUT %s entry=%.4f sl=%.4f ref=%.4f %s",
+             symbol, direction, entry, sl, ref_level, signals)
+
+    res = place_order(symbol, direction, qty, sl, tp)   # market IOC — momentum entry
+    if not res:
+        return None
+
+    real_entry, liq = get_position_entry_liq(symbol)
+    if real_entry > 0:
+        entry = real_entry
+    risk_usdt = abs(entry - sl) * qty
+
+    trade = {
+        "timestamp":   datetime.datetime.utcnow().isoformat(),
+        "symbol":      symbol, "direction": direction,
+        "entry_mode":  "breakout",
+        "score":       float(len(signals)), "signals": signals,
+        "entry":       entry, "sl": sl, "tp": tp,
+        "qty":         qty, "leverage": leverage, "rr": 0.0,
+        "ext_atr":     0.0,
+        "regime_4h":   "BO", "regime_1h": "BO",
+        "hour_utc":    datetime.datetime.utcnow().hour,
+        "outcome":     None, "pnl": None, "closed_at": None,
+        "exit_reason": None,
+        "tp1_done":    False, "tp1_realized": 0.0,
+        "order_result": res,
+    }
+    log_trade(trade)
+
+    emoji  = "🟢" if direction == "Buy" else "🔴"
+    dlabel = "LONG" if direction == "Buy" else "SHORT"
+    sl_pct = (sl - entry) / entry * 100
+    discord_notify(
+        f"{emoji} **BREAKOUT {dlabel} {symbol}** ⚡\n"
+        f"Broke `{ref_level}` on {signals[1]} | risk `{BREAKOUT_RISK_PCT*100:.0f}%`\n"
+        f"Entry `{entry}` | SL `{sl}` (`{sl_pct:+.1f}%`) | trailing exit\n"
+        f"Qty `{qty}` | Risk `{risk_usdt:.2f}` USDT | {leverage}x"
     )
     return trade
 
@@ -1866,6 +2059,8 @@ def main():
                     if not (FUNDING_RATE_MIN<=fr<=FUNDING_RATE_MAX): continue
                     try:
                         trade=scan_symbol(sym,bal,regime,ls)
+                        if not (trade and trade.get("order_result")) and BREAKOUT_ENABLED:
+                            trade=scan_symbol_breakout(sym,bal,regime,ls)
                         if trade and trade.get("order_result"): op=get_open_positions()
                     except Exception as e:
                         log.error("Error scanning %s: %s",sym,e)
