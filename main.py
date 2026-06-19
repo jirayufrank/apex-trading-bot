@@ -1004,11 +1004,11 @@ def _symbol_regime_from_df(df4h_c: pd.DataFrame, df1h_c: pd.DataFrame) -> dict:
     r4h = _classify_ema(df4h_c["close"])
     r1h = _classify_ema(df1h_c["close"]) if len(df1h_c) >= 50 else "RANGE"
     if r4h == "BULL":
-        if r1h == "BULL":    allowed, thr = "Buy", 4
+        if r1h == "BULL":    allowed, thr = "Buy", 4.5
         elif r1h == "RANGE": allowed, thr = "Buy", 5
         else:                allowed, thr = "SKIP", 5
     elif r4h == "BEAR":
-        if r1h == "BEAR":    allowed, thr = "Sell", 4
+        if r1h == "BEAR":    allowed, thr = "Sell", 4.5
         elif r1h == "RANGE": allowed, thr = "Sell", 5
         else:                allowed, thr = "SKIP", 5
     else:  # 4H RANGE — only follow a clear 1H push
@@ -1515,6 +1515,12 @@ def scan_symbol(symbol:str, balance:float, regime:Optional[dict]=None,
     if allowed == "SKIP" or allowed != direction:
         log.info("%s SKIP coin regime (%s/%s -> %s vs %s)",
                  symbol, sr.get("regime_4h"), sr.get("regime_1h"), allowed, direction)
+        return None
+
+    # [TWEAK2] block pullback when the coin's OWN 4H is RANGE (backtest PF 0.70 here).
+    # Breakout entries use a separate path (scan_symbol_breakout) and are not affected.
+    if sr.get("regime_4h") == "RANGE":
+        log.info("%s SKIP pullback — coin 4H RANGE (no trend to pull back into)", symbol)
         return None
 
     # BTC veto (skip for gold, which is uncorrelated). regime = BTC market regime.
